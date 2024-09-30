@@ -27,7 +27,9 @@ Module modCSharpCheck
         ' Carry out any specific checks for the language in question
         '===========================================================
 
-        IdentifyLabels(CodeLine, FileName)
+        CheckXXE(CodeLine, FileName)                    ' Check for XXE
+        CheckUnrestrictedFileUpload(CodeLine, FileName) ' Check for Unrestricted File Upload
+        IdentifyLabels(CodeLine, FileName)              ' Identify and record ASP.NET label controls in the code, which may be vulnerable to XSS if not properly sanitized.
         CheckInputValidation(CodeLine, FileName)        ' Has .NET default validation been turned off?
         CheckSQLInjection(CodeLine, FileName)           ' Check for SQLi
         CheckXSS(CodeLine, FileName)                    ' Check for XSS
@@ -44,6 +46,7 @@ Module modCSharpCheck
         CheckThreadIssues(CodeLine, FileName)           ' Check for good/bad thread management
         CheckExecutable(CodeLine, FileName)             ' Check for unvalidated variables being executed via cmd line/system calls
         CheckWebConfig(CodeLine, FileName)              ' Check config file to determine whether .NET debugging and default errors are enabled
+        CheckProcessInjection(CodeLine, FileName)       ' Check for potential process injection or hollowing techniques
 
         If Regex.IsMatch(CodeLine, "\S*(Password|password|pwd|passwd)\S*(\.|\-\>)(ToLower|ToUpper)\s*\(") Then
             frmMain.ListCodeIssue("Unsafe Password Management", "The application appears to handle passwords in a case-insensitive manner. This can greatly increase the likelihood of successful brute-force and/or dictionary attacks.", FileName, CodeIssue.MEDIUM, CodeLine)
@@ -87,6 +90,85 @@ Module modCSharpCheck
 
     End Sub
 
+    Public Sub CheckUnrestrictedFileUpload(CodeLine As String, FileName As String)
+        Dim isUploadFunctionPresent As Boolean = False
+        Dim allowedExtensions As String() = {".txt", ".jpg", ".jpeg", ".png", ".gif", ".pdf", ".mp4", ".mov", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".xps"}
+
+        ' Check for presence of file upload elements and functions in both ASP.NET Web Forms and ASP.NET Core
+        If CodeLine.Contains("Request.Files") Or CodeLine.Contains("HttpPostedFileBase") Or
+            CodeLine.Contains("FileUpload") Or CodeLine.Contains("UploadFile") Or CodeLine.Contains("SaveAs") Or
+            CodeLine.Contains("IFormFile") Or CodeLine.Contains("Request.Form.Files") Then
+            isUploadFunctionPresent = True
+        End If
+
+        ' Check for allowed extensions
+        If isUploadFunctionPresent Then
+            Dim hasAllowedExtensions As Boolean = False
+            For Each extension As String In allowedExtensions
+                If CodeLine.Contains(extension) Then
+                    hasAllowedExtensions = True
+                    Exit For
+                End If
+            Next
+
+            If Not hasAllowedExtensions Then
+                frmMain.ListCodeIssue("Insecure File Upload", "Allowed file extensions are not properly defined.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+
+            If Not (CodeLine.Contains(".Length") Or CodeLine.Contains(".Size")) Then
+                frmMain.ListCodeIssue("File Size Validation Missing", "File size limits are not validated.", FileName, CodeIssue.MEDIUM, CodeLine)
+            End If
+        End If
+    End Sub
+
+
+    Public Sub CheckXXE(CodeLine As String, FileName As String)
+        ' Check for potential XXE vulnerabilities in XML parsing code
+        '===========================================================
+
+        ' Check for use of XmlDocument with XmlResolver not set to null
+        If Regex.IsMatch(CodeLine, "XmlDocument\s+parser\s*=\s*new\s+XmlDocument\(\);") Then
+            If Regex.IsMatch(CodeLine, "parser\.XmlResolver\s*=\s*new\s+XmlUrlResolver\(\);") Then
+                frmMain.ListCodeIssue("XXE Vulnerability", "The code is vulnerable to XXE attacks as it uses XmlUrlResolver. Consider setting XmlResolver to null.", FileName, CodeIssue.HIGH, CodeLine)
+            ElseIf Regex.IsMatch(CodeLine, "parser\.XmlResolver\s*=\s*null;") Then
+                ' Compliant code, do nothing
+            ElseIf Regex.IsMatch(CodeLine, "parser\.XmlResolver\s*=\s*.*;") Then
+                frmMain.ListCodeIssue("XXE Vulnerability", "The XmlResolver should be set to null to prevent XXE attacks.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+
+        ' Check for use of XDocument (safe by default in .NET 4.5.2 and later)
+        If Regex.IsMatch(CodeLine, "XDocument\s+doc\s*=\s*new\s+XDocument\(\);") Then
+            frmMain.ListCodeIssue("XXE Vulnerability", "XDocument is safe by default from .NET 4.5.2 onwards, but ensure the application is not targeting an earlier version.", FileName, CodeIssue.LOW, CodeLine)
+        End If
+
+        ' Check for use of XmlTextReader and ensure DtdProcessing is set to Prohibit
+        If Regex.IsMatch(CodeLine, "XmlTextReader\s+reader\s*=\s*new\s+XmlTextReader\(\s*.*\s*\);") Then
+            If Not Regex.IsMatch(CodeLine, "reader\.DtdProcessing\s*=\s*DtdProcessing\.Prohibit;") Then
+                frmMain.ListCodeIssue("XXE Vulnerability", "XmlTextReader should have DtdProcessing set to Prohibit to prevent XXE attacks.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+
+        ' Check for XPathNavigator and ensure it's created with a safe parser
+        If Regex.IsMatch(CodeLine, "XPathNavigator\s+nav\s*=\s*doc\.CreateNavigator\(\);") Then
+            If Not Regex.IsMatch(CodeLine, "XPathDocument\s+doc\s*=\s*new\s+XPathDocument\(\s*XmlReader\.Create\(\s*.*\s*\)\);") Then
+                frmMain.ListCodeIssue("XXE Vulnerability", "Ensure that XPathNavigator is created with a safe XmlReader to prevent XXE attacks.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+
+        ' Check for XmlReader and ensure DtdProcessing is set to Prohibit
+        If Regex.IsMatch(CodeLine, "XmlReader\s+reader\s*=\s*XmlReader\.Create\(\s*.*\s*\);") Then
+            If Not Regex.IsMatch(CodeLine, "reader\.DtdProcessing\s*=\s*DtdProcessing\.Prohibit;") Then
+                frmMain.ListCodeIssue("XXE Vulnerability", "XmlReader should have DtdProcessing set to Prohibit to prevent XXE attacks.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+
+        ' Check for use of XmlReaderSettings
+        If Regex.IsMatch(CodeLine, "XmlReaderSettings") Then
+            frmMain.ListCodeIssue("XXE Vulnerability", "The code uses XmlReaderSettings, which may enable DTD processing. Ensure DtdProcessing is set to Prohibit.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+    End Sub
+
     Public Sub CheckSQLInjection(CodeLine As String, FileName As String)
         ' Check for any SQL injection problems 
         '=====================================
@@ -109,9 +191,9 @@ Module modCSharpCheck
         If Regex.IsMatch(CodeLine, "validate|encode|sanitize|sanitise") Then
             '== Remove any variables which have been sanitised from the list of vulnerable variables ==  
             RemoveSanitisedVars(CodeLine)
-        ElseIf Regex.IsMatch(CodeLine, "ExecuteQuery|ExecuteSQL|ExecuteStatement|SqlCommand\(") Then
+        ElseIf Regex.IsMatch(CodeLine, "ExecuteQuery|ExecuteSQL|ExecuteStatement|SqlCommand\(|ExecuteNonQuery|ExecuteScalar|ExecuteReader") Then
 
-            '== Check usage of java.sql.Statement.executeQuery, etc. ==
+            '== Check usage of SQL execution methods == 
             If CodeLine.Contains("""") And CodeLine.Contains("&") Then
                 '== Dynamic SQL built into connection/update ==
                 frmMain.ListCodeIssue("Potential SQL Injection", "The application appears to allow SQL injection via dynamic SQL statements.", FileName, CodeIssue.CRITICAL, CodeLine)
@@ -265,7 +347,7 @@ Module modCSharpCheck
 
         If Regex.IsMatch(CodeLine, "validate|encode|sanitize|sanitise") Then Exit Sub
 
-        If CodeLine.ToLower.Contains(".ProcessStartInfo(") Then
+        If CodeLine.ToLower.Contains("process\.start|shellexecute|.ProcessStartInfo(") Then
             For Each strVar In ctCodeTracker.InputVars
                 If CodeLine.Contains(strVar) Then
                     frmMain.ListCodeIssue("User Controlled Variable Used on System Command Line", "The application appears to allow the use of an unvalidated user-controlled variable when executing a command.", FileName, CodeIssue.HIGH, CodeLine)
@@ -279,6 +361,37 @@ Module modCSharpCheck
         End If
 
     End Sub
+
+    Public Sub CheckProcessInjection(CodeLine As String, FileName As String)
+        ' Check for potential process injection or hollowing techniques
+        '=========================================================================
+
+        Dim blnIsFound As Boolean
+        blnIsFound = False
+
+        ' List of keywords related to process injection/hollowing
+        If Regex.IsMatch(CodeLine.ToLower(), "createremotethread|writeprocessmemory|virtualallocex|ntunmapviewofsection|setthreadcontext|resumethread|rtlcreateprocessreflection|ntgetnextprocess") Then
+            ' Check for potential code injection patterns
+            For Each strVar In ctCodeTracker.InputVars
+                If CodeLine.Contains(strVar) Then
+                    frmMain.ListCodeIssue("Potential Process Injection Technique",
+                    "The code contains potential process injection/hollowing techniques with user-controlled variables.",
+                    FileName, CodeIssue.CRITICAL, CodeLine)
+                    blnIsFound = True
+                    Exit For
+                End If
+            Next
+
+            ' If no user-controlled variables are found
+            If blnIsFound = False Then
+                frmMain.ListCodeIssue("Process Injection Technique Detected",
+                "The code contains potential process injection/hollowing techniques. Manual review required to check for misuse.",
+                FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+
+    End Sub
+
 
     Public Sub CheckLogDisplay(CodeLine As String, FileName As String)
         ' Check output written to logs is sanitised first
@@ -304,39 +417,51 @@ Module modCSharpCheck
     End Sub
 
     Public Sub CheckSerialization(CodeLine As String, FileName As String)
-        ' Check for insecure object serialization and deserialization
-        '============================================================
+        ' Check for insecure serialization and deserialization vulnerabilities
+        '=====================================================================
+
         Dim strClassName As String = ""
         Dim arrFragments As String()
 
+        ' Regex patterns for serialization and sanitization checks
+        Dim serializerPattern As String = "\b(?:BinaryFormatter|SoapFormatter|XmlSerializer|DataContractSerializer|JavaScriptSerializer)\b"
+        Dim sanitizationPattern As String = "\b(?:SanitizeInput|Escape|HtmlEncode|UrlEncode|Clean|Validate)\s*\("
+        Dim gadgetPattern As String = "\b(?:System.Diagnostics.Process|System.Runtime.InteropServices.Marshal|System.IO.File|System.Security.Principal.WindowsIdentity|System.Web.UI.Page)\b"
 
-        If ctCodeTracker.IsSerializable = True Then
-            '== File content is deserialized into onjects - flag this up for further investigation ==
-            If Regex.IsMatch(CodeLine, "\.(Deserialize|ReadObject)\s*\(") Then
-                frmMain.ListCodeIssue("Unsafe Object Deserialization", "The code allows objects to be deserialized. This can allow potentially hostile objects to be instantiated directly from data held in the filesystem.", FileName, CodeIssue.STANDARD, CodeLine)
+        ' Check for insecure deserialization
+        If Regex.IsMatch(CodeLine, "\.(Deserialize|ReadObject)\s*\(") Then
+            frmMain.ListCodeIssue("Unsafe Object Deserialization", "The code allows objects to be deserialized. This can allow potentially hostile objects to be instantiated directly from data held in the filesystem.", FileName, CodeIssue.STANDARD, CodeLine)
+        End If
+
+        ' Check if serialization or deserialization classes are used
+        If Regex.IsMatch(CodeLine, serializerPattern) Then
+            ' Check for common sanitization methods
+            If Not Regex.IsMatch(CodeLine, sanitizationPattern) Then
+                frmMain.ListCodeIssue("Insecure Deserialization", "The application may be deserializing untrusted input. Verify that input is validated before deserialization.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+
+            ' Check for known gadgets that could be used for exploitation
+            If Regex.IsMatch(CodeLine, gadgetPattern) Then
+                frmMain.ListCodeIssue("Insecure Deserialization - Gadget Detected", "Potentially dangerous gadget found. Review code for exploitation risks associated with deserialization.", FileName, CodeIssue.HIGH, CodeLine)
             End If
         End If
 
+        ' Check for serialization
         If ctCodeTracker.IsSerializable = False And CodeLine.Contains("using System.Runtime.Serialization") Then
-            '== Serialization is implemented in the code module ==
+            ' Serialization is implemented in the code module
             ctCodeTracker.IsSerializable = True
         ElseIf ctCodeTracker.IsSerializable = True And ctCodeTracker.IsSerializableClass = False And CodeLine.Contains("[Serializable") Then
-            '== Serialization is implemented for the class ==
+            ' Serialization is implemented for the class
             ctCodeTracker.IsSerializableClass = True
         ElseIf ctCodeTracker.IsSerializable = True And ctCodeTracker.IsSerializableClass = False And (CodeLine.Contains("[assembly: SecurityPermission(") Or CodeLine.Contains("[SecurityPermissionAttribute(")) Then
-            '== Serialization is safely implemented so discontinue the checks ==
+            ' Serialization is safely implemented so discontinue the checks
             ctCodeTracker.IsSerializable = False
             ctCodeTracker.IsSerializableClass = False
         ElseIf ctCodeTracker.IsSerializableClass = True And CodeLine.Contains("public class ") Then
-            '== Extract the vulnerable class name and write out results ==
-
-            ' Now we have the class name this must be reset to false
-            ctCodeTracker.IsSerializableClass = False
-
-            ' Trim away any redundant text following the classname
+            ' Extract the vulnerable class name and write out results
+            ctCodeTracker.IsSerializableClass = False ' Reset after class name is found
             arrFragments = CodeLine.Split("{")
             arrFragments = arrFragments.First().Split(":")
-
             strClassName = GetLastItem(arrFragments.First())
             If Regex.IsMatch(strClassName, "^[a-zA-Z0-9_]*$") Then
                 frmMain.ListCodeIssue("Unsafe Object Serialization", "The code allows the object " & strClassName & " to be serialized. This can allow potentially sensitive data to be saved to the filesystem.", FileName, CodeIssue.STANDARD, CodeLine)
@@ -346,27 +471,47 @@ Module modCSharpCheck
     End Sub
 
     Public Sub CheckHTTPRedirect(CodeLine As String, FileName As String)
-        ' Check for safe use HTTP redirects
-        '==================================
-        Dim blnIsFound As Boolean = False
+        ' Check for safe use HTTP redirects and potential open redirect vulnerabilities
+        '================================================================================
 
+        Dim blnIsFound As Boolean = False
 
         '== Check for secure HTTP usage ==
         If CodeLine.Contains("Response.Redirect(") And CodeLine.Contains("HTTP:") Then
-            frmMain.ListCodeIssue("URL request sent over HTTP:", "The URL used in the HTTP request appears to be unencrypted. Check the code manually to ensure that sensitive data is not being submitted.", FileName, CodeIssue.STANDARD, CodeLine)
+            frmMain.ListCodeIssue("URL request sent over HTTP:",
+            "The URL used in the HTTP request appears to be unencrypted. Check the code manually to ensure that sensitive data is not being submitted.",
+            FileName, CodeIssue.STANDARD, CodeLine)
+
+            '== Check for insecure variables in redirects ==
         ElseIf Regex.IsMatch(CodeLine, "Response\.Redirect\(") And Not Regex.IsMatch(CodeLine, "Response\.Redirect\(\s*\""\S+\""\s*\)") Then
             For Each strVar In ctCodeTracker.InputVars
                 If Regex.IsMatch(CodeLine, "Response\.Redirect\(\s*" & strVar) Or Regex.IsMatch(CodeLine, "Response\.Redirect\(\s*(\""\S+\""|S+)\s*(\+|\&)\s*" & strVar) Then
-                    frmMain.ListCodeIssue("URL Request Gets Path from Unvalidated Variable", "The URL used in the HTTP request is loaded from an unsanitised variable. This can allow an attacker to redirect the user to a site under the control of a third party.", FileName, CodeIssue.MEDIUM, CodeLine)
+                    frmMain.ListCodeIssue("URL Request Gets Path from Unvalidated Variable",
+                    "The URL used in the HTTP request is loaded from an unsanitised variable. This can allow an attacker to redirect the user to a site under the control of a third party.",
+                    FileName, CodeIssue.MEDIUM, CodeLine)
                     blnIsFound = True
                     Exit For
                 End If
             Next
             If blnIsFound = False Then
-                frmMain.ListCodeIssue("URL Request Gets Path from Variable", "The URL used in the HTTP request appears to be loaded from a variable. Check the code manually to ensure that malicious URLs cannot be submitted by an attacker.", FileName, CodeIssue.STANDARD, CodeLine)
+                frmMain.ListCodeIssue("URL Request Gets Path from Variable",
+                "The URL used in the HTTP request appears to be loaded from a variable. Check the code manually to ensure that malicious URLs cannot be submitted by an attacker.",
+                FileName, CodeIssue.STANDARD, CodeLine)
             End If
         End If
 
+        '== Check for potential open redirect vulnerabilities ==
+        Dim redirectPattern As String = "\bResponse\.Redirect\s*\(\s*[^""]+\s*\)|\bServer\.Transfer\s*\(\s*[^""]+\s*\)"
+        Dim queryParamPattern As String = "\?url=|redirect=|returnUrl="
+
+        If Regex.IsMatch(CodeLine, redirectPattern) OrElse Regex.IsMatch(CodeLine, queryParamPattern) Then
+            Dim validationPattern As String = "\b(StartsWith|UrlEncode|IsLocalUrl|SanitizeInput|Validate)\s*\("
+            If Not Regex.IsMatch(CodeLine, validationPattern) Then
+                frmMain.ListCodeIssue("Open Redirect Vulnerability",
+                "The application appears to allow open redirects without proper validation or sanitization of the URL. Ensure all redirect URLs are validated to prevent open redirects.",
+                FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
     End Sub
 
     Private Sub CheckRandomisation(CodeLine As String, FileName As String)
@@ -650,12 +795,115 @@ Module modCSharpCheck
 
         If Not FileName.ToLower.EndsWith("web.config") Then Exit Sub
 
+        ' Check for .NET Default Errors Enabled
         If Regex.IsMatch(CodeLine, "\<\s*customErrors\s+mode\s*\=\s*\""Off\""\s*\/\>") Then
             frmMain.ListCodeIssue(".NET Default Errors Enabled", "The application is configured to display .NET default errors. This can provide an attacker with useful information and should not be used in a live application.", FileName, CodeIssue.MEDIUM)
+
+            ' Check for .NET Debugging Enabled
         ElseIf Regex.IsMatch(CodeLine, "\bdebug\b\s*\=\s*\""\s*true\s*\""") Then
             frmMain.ListCodeIssue(".NET Debugging Enabled", "The application is configured to return .NET debug information. This can provide an attacker with useful information and should not be used in a live application.", FileName, CodeIssue.MEDIUM)
-        End If
 
+            ' Check for IIS Custom Errors Enabled
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*customErrors\s+mode\s*\=\s*\""On\""\s+defaultRedirect\s*\=\s*\""~/Error\""\s*\/\>") Then
+            frmMain.ListCodeIssue("IIS Custom Errors Enabled", "Custom errors are properly configured to prevent accidental leakage of error details to clients.", FileName, CodeIssue.LOW)
+
+            ' Check for HTTP Errors Mode set to Custom
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*httpErrors\s+errorMode\s*\=\s*\""Custom\""\s*\/\>") Then
+            frmMain.ListCodeIssue("HTTP Errors Custom Mode Enabled", "HTTP errors are set to custom mode, improving user experience and preventing error details leakage.", FileName, CodeIssue.LOW)
+
+            ' Check for Debug Compilation Disabled
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*compilation\s+debug\s*\=\s*\""false\""\s*\/\>") Then
+            frmMain.ListCodeIssue("Debug Compilation Disabled", "The debug compilation setting is correctly set to false to avoid performance issues in production.", FileName, CodeIssue.LOW)
+
+            ' Check for IIS Version Exposure Prevention
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*modules\s+runAllManagedModulesForAllRequests\s*\=\s*\""true\""\s*\/\>") Then
+            frmMain.ListCodeIssue("IIS Version Exposure Prevention", "The configuration ensures that the IIS version is not exposed via the Server HTTP response header.", FileName, CodeIssue.LOW)
+
+            ' Check for Removing Server Header in IIS 7+
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*requestFiltering\s+removeServerHeader\s*\=\s*\""true\""\s*\/\>") Then
+            frmMain.ListCodeIssue("IIS Server Header Removal", "The configuration ensures that the Server HTTP response header is removed in IIS 7+ to prevent IIS version exposure.", FileName, CodeIssue.LOW)
+
+            ' Check for ASP.NET Version Exposure Prevention
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*remove\s+name\s*\=\s*\""X-Powered-By\""\s*\/\>") Then
+            frmMain.ListCodeIssue("ASP.NET Version Exposure Prevention", "The X-Powered-By header is removed to prevent ASP.NET version exposure.", FileName, CodeIssue.LOW)
+
+            ' Check for ASP.NET Version Header Removal Using Rewrite Rule
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*rule\s+name\s*\=\s*\""Remove X-Powered-By HTTP response header\""\>") Then
+            frmMain.ListCodeIssue("ASP.NET Version Exposure Prevention Using Rewrite", "An IIS URL Rewrite rule is used to remove the X-Powered-By header, preventing ASP.NET version exposure.", FileName, CodeIssue.LOW)
+
+            ' Check for ASP.NET Version Header Disabled
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*httpRuntime\s+enableVersionHeader\s*\=\s*\""false\""\s*\/\>") Then
+            frmMain.ListCodeIssue("ASP.NET Version Header Disabled", "The version header in ASP.NET is disabled to prevent version exposure.", FileName, CodeIssue.LOW)
+
+            ' Check for HTTPS Requirement
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*httpRedirect\s+enabled\s*\=\s*\""false\""\s*\/\>") Then
+            frmMain.ListCodeIssue("HTTPS Requirement in Root Site", "The configuration disables HTTP redirects, ensuring that HTTPS is required.", FileName, CodeIssue.LOW)
+
+            ' Check for HTTP-Only and SSL-Only Cookies
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*httpCookies\s+httpOnlyCookies\s*\=\s*\""true\""\s+requireSSL\s*\=\s*\""true\""\s*\/\>") Then
+            frmMain.ListCodeIssue("HTTP-Only and SSL-Only Cookies Enabled", "The cookies are set to HTTP-Only and SSL-Only, protecting against XSS and man-in-the-middle attacks.", FileName, CodeIssue.LOW)
+
+            ' Check for SSL Requirement for Forms Authentication
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*forms\s+requireSSL\s*\=\s*\""true\""\s*\/\>") Then
+            frmMain.ListCodeIssue("SSL Required for Forms Authentication", "The configuration ensures that SSL is required for forms authentication cookies, protecting against unauthorized access.", FileName, CodeIssue.LOW)
+
+            ' Check for HSTS (Strict Transport Security)
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*appendHeader\s+name\s*\=\s*\""Strict-Transport-Security\""\s+value\s*\=\s*\""max-age\=31536000\""\s*\/\>") Then
+            frmMain.ListCodeIssue("Strict Transport Security (HSTS) Enabled", "The Strict-Transport-Security header is enabled, helping prevent HTTPS Strip and man-in-the-middle attacks.", FileName, CodeIssue.LOW)
+
+            ' Check for Click-Jacking Protection (X-Frame-Options)
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*add\s+name\s*\=\s*\""X-Frame-Options\""\s+value\s*\=\s*\""DENY\""\s*\/\>") Then
+            frmMain.ListCodeIssue("Click-Jacking Protection", "The X-Frame-Options header is set to DENY, preventing Click-Jacking attacks.", FileName, CodeIssue.LOW)
+
+            ' Check for X-Frame-Options SAMEORIGIN
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*add\s+name\s*\=\s*\""X-Frame-Options\""\s+value\s*\=\s*\""SAMEORIGIN\""\s*\/\>") Then
+            frmMain.ListCodeIssue("Framing Allowed from Same Origin", "The X-Frame-Options header is set to SAMEORIGIN, allowing framing only from the same origin.", FileName, CodeIssue.LOW)
+
+            ' Check for Cache Control
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*meta\s+http\-equiv\s*\=\s*\""Cache\-Control\""\s+content\s*\=\s*\""no\-cache, no\-store\""\s*\/\>") Then
+            frmMain.ListCodeIssue("Cache Control for Secure Content", "Cache-Control is set to no-cache, no-store to prevent secure content from being cached.", FileName, CodeIssue.LOW)
+
+            ' Check for Machine Encryption and Decryption Keys
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*machineKey\s+decryption\s*\=\s*\""AES\""\s+decryptionKey\s*\=\s*\""[A-Za-z0-9]+\""\s+validation\s*\=\s*\""SHA1\""\s+validationKey\s*\=\s*\""[A-Za-z0-9]+\""\s*\/\>") Then
+            frmMain.ListCodeIssue("Machine Encryption/Decryption Keys Configured", "Machine keys for encryption and decryption are explicitly configured.", FileName, CodeIssue.LOW)
+
+            ' Check for Trace.axd Disabled
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*trace\s+enabled\s*\=\s*\""false\""\s+localOnly\s*\=\s*\""true\""\s*\/\>") Then
+            frmMain.ListCodeIssue("Trace.axd Disabled", "Trace.axd is disabled, preventing accidental information leakage in production environments.", FileName, CodeIssue.LOW)
+
+            ' Check for Azure ARRAffinity Cookie
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*add\s+name\s*\=\s*\""Arr-Disable-Session-Affinity\""\s+value\s*\=\s*\""True\""\s*\/\>") Then
+            frmMain.ListCodeIssue("ARR Affinity Cookie Disabled", "ARR Affinity cookie is disabled, preventing insecure session affinity cookies in Azure.", FileName, CodeIssue.LOW)
+
+            ' Check for Role Manager SSL Requirement
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*roleManager\s+cookieRequireSSL\s*\=\s*\""true\""\s*\/\>") Then
+            frmMain.ListCodeIssue("Secure Role Manager Cookies", "Role Manager cookies are set to require SSL, enhancing security for role management.", FileName, CodeIssue.LOW)
+
+            ' Check for OWIN Secure Cookies
+        ElseIf Regex.IsMatch(CodeLine, "CookieSecure\s*=\s*CookieSecureOption.Always") Then
+            frmMain.ListCodeIssue("Secure OWIN Cookies", "OWIN cookie authentication is configured to use secure cookies, preventing cookie theft.", FileName, CodeIssue.LOW)
+
+            ' Check for Renamed Forms Authentication Cookie
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*forms\s+name\s*\=\s*\""myformscookie\""\s*\/\>") Then
+            frmMain.ListCodeIssue("Renamed Forms Authentication Cookie", "Forms authentication cookie has been renamed to obscure technology stack.", FileName, CodeIssue.LOW)
+
+            ' Check for Renamed Role Manager Cookie
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*roleManager\s+cookieName\s*\=\s*\""myrolescookie\""\s*\/\>") Then
+            frmMain.ListCodeIssue("Renamed Role Manager Cookie", "Role Manager cookie has been renamed to obscure technology stack.", FileName, CodeIssue.LOW)
+
+            ' Check for Renamed Session State Cookie
+        ElseIf Regex.IsMatch(CodeLine, "\<\s*sessionState\s+cookieName\s*\=\s*\""mysessioncookie\""\s*\/\>") Then
+            frmMain.ListCodeIssue("Renamed Session State Cookie", "Session state cookie has been renamed to obscure technology stack.", FileName, CodeIssue.LOW)
+
+            ' Check for Renamed Anti-Forgery Cookie
+        ElseIf Regex.IsMatch(CodeLine, "AntiForgeryConfig.CookieName\s*=\s*\""myxsrfcookie\"";") Then
+            frmMain.ListCodeIssue("Renamed Anti-Forgery Cookie", "Anti-Forgery cookie has been renamed to obscure technology stack.", FileName, CodeIssue.LOW)
+
+            ' Check for Renamed ASP.NET Identity Cookie
+        ElseIf Regex.IsMatch(CodeLine, "CookieName\s*=\s*\""myauthcookie\"";") Then
+            frmMain.ListCodeIssue("Renamed ASP.NET Identity Cookie", "ASP.NET Identity cookie has been renamed to obscure technology stack.", FileName, CodeIssue.LOW)
+
+        End If
     End Sub
 
 End Module

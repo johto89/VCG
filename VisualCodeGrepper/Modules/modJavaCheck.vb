@@ -30,22 +30,23 @@ Module modJavaCheck
         ' Is there a struts validator or similar framework in place?
         If ctCodeTracker.HasValidator = False And FileName.ToLower.EndsWith(".xml") And CodeLine.ToLower.Contains("<plug-in") And CodeLine.ToLower.Contains(".validator") Then ctCodeTracker.HasValidator = True
 
-        CheckServlet(CodeLine, FileName)            ' Check for any issues specific to servlets
-        CheckSQLiValidation(CodeLine, FileName)     ' Check for potential SQLi
-        CheckXSSValidation(CodeLine, FileName)      ' Check for potential XSS
-        CheckRunTime(CodeLine, FileName)            ' Check use of java.lang.Runtime.exec
-        CheckIsHttps(CodeLine, FileName)            ' Check any URLs being used are not http
-        CheckClone(CodeLine, FileName)              ' Check for unsafe cloning implementation
-        CheckSerialize(CodeLine, FileName)          ' Check for unsafe serialization implementation
-        IdentifyServlets(CodeLine)                  ' List any servlet instantiations for the thread checks
-        CheckModifiers(CodeLine, FileName)          ' Check for public variables in classes
-        CheckThreadIssues(CodeLine, FileName)       ' Check for good/bad thread management
-        CheckUnsafeTempFiles(CodeLine, FileName)    ' Check for temp files with obvious names
-        CheckPrivileged(CodeLine, FileName)         ' Check for potential user access to code with system privileges
-        CheckRequestDispatcher(CodeLine, FileName)  ' Check for user control of request dispatcher
-        CheckXXEExpansion(CodeLine, FileName)       ' Check for safe/unsafe XML expansion
-        CheckOverflow(CodeLine, FileName)           ' Check use of primitive types and any operations upon them
-        CheckResourceRelease(CodeLine, FileName)    ' Are file resources safely handled in try ... catch blocks
+        CheckServlet(CodeLine, FileName)                    ' Check for any issues specific to servlets
+        CheckSQLiValidation(CodeLine, FileName)             ' Check for potential SQLi
+        CheckXSSValidation(CodeLine, FileName)              ' Check for potential XSS
+        CheckRunTime(CodeLine, FileName)                    ' Check use of java.lang.Runtime.exec
+        CheckIsHttps(CodeLine, FileName)                    ' Check any URLs being used are not http
+        CheckClone(CodeLine, FileName)                      ' Check for unsafe cloning implementation
+        CheckSerialize(CodeLine, FileName)                  ' Check for unsafe serialization implementation
+        IdentifyServlets(CodeLine)                          ' List any servlet instantiations for the thread checks
+        CheckModifiers(CodeLine, FileName)                  ' Check for public variables in classes
+        CheckThreadIssues(CodeLine, FileName)               ' Check for good/bad thread management
+        CheckUnsafeTempFiles(CodeLine, FileName)            ' Check for temp files with obvious names
+        CheckPrivileged(CodeLine, FileName)                 ' Check for potential user access to code with system privileges
+        CheckRequestDispatcher(CodeLine, FileName)          ' Check for user control of request dispatcher
+        CheckXXEExpansion(CodeLine, FileName)               ' Check for safe/unsafe XML expansion
+        CheckOverflow(CodeLine, FileName)                   ' Check use of primitive types and any operations upon them
+        CheckResourceRelease(CodeLine, FileName)            ' Are file resources safely handled in try ... catch blocks
+        CheckInsecureDeserialization(CodeLine, FileName)    ' Check for insecure deserialization vulnerabilities
 
         ' Identify any nested classes (if required by user)
         If asAppSettings.IsInnerClassCheck Then CheckInnerClasses(CodeLine, FileName)
@@ -793,5 +794,81 @@ Module modJavaCheck
         End If
 
     End Sub
+
+    Private Sub CheckInsecureDeserialization(CodeLine As String, FileName As String)
+        ' Check for insecure deserialization vulnerabilities
+        '==================================================
+        ' Define patterns for deserialization methods and APIs
+        Dim deserializationPatterns As New List(Of String) From {
+        "\.readObject\(",
+        "\.readUnshared\(",
+        "New XMLDecoder\(",
+        "New XStream\("
+    }
+        Dim customDeserializationPatterns As New List(Of String) From {
+        "Private Sub readObject\(",
+        "Private Sub readObjectNoData\(",
+        "Function readResolve\(",
+        "Sub readExternal\("
+    }
+        Dim gadgetPatterns As New List(Of String) From {
+        "CommonsCollections",
+        "BeanShell1",
+        "Groovy1",
+        "Spring1"
+    }
+
+        ' Check for actual use of insecure deserialization APIs (not just imports)
+        If deserializationPatterns.Any(Function(p) System.Text.RegularExpressions.Regex.IsMatch(CodeLine, p)) Then
+            ' Ensure input validation exists before deserialization
+            If Not ctCodeTracker.HasInputValidation Then
+                frmMain.ListCodeIssue("Potential Insecure Deserialization",
+                               "Using deserialization methods or APIs without apparent input validation.",
+                               FileName,
+                               CodeIssue.MEDIUM) ' Changed to Medium severity
+            End If
+        End If
+
+        ' Check for custom deserialization methods
+        If customDeserializationPatterns.Any(Function(p) System.Text.RegularExpressions.Regex.IsMatch(CodeLine, p)) Then
+            frmMain.ListCodeIssue("Custom Deserialization Implementation",
+                           "Detected custom deserialization methods. Ensure input validation and type checking.",
+                           FileName,
+                           CodeIssue.MEDIUM)
+        End If
+
+        ' Check for use of XMLDecoder (potential RCE risk)
+        If System.Text.RegularExpressions.Regex.IsMatch(CodeLine, "New XMLDecoder\(") Then
+            frmMain.ListCodeIssue("Use of XMLDecoder",
+                           "XMLDecoder may lead to remote code execution if data is user-controlled.",
+                           FileName,
+                           CodeIssue.HIGH)
+        End If
+
+        ' Check for use of XStream with fromXML (version <= 1.46 may be vulnerable)
+        If CodeLine.Contains("XStream") And CodeLine.Contains(".fromXML(") Then
+            frmMain.ListCodeIssue("Use of XStream",
+                           "XStream (version <= 1.46) has vulnerabilities related to deserialization. Ensure to check the version and validate input data.",
+                           FileName,
+                           CodeIssue.MEDIUM)
+        End If
+
+        ' Check for gadget chains in ysoserial
+        If gadgetPatterns.Any(Function(p) CodeLine.Contains(p)) Then
+            frmMain.ListCodeIssue("Potential Gadget Chain",
+                           "Detected potential gadget chain from ysoserial. Consider thoroughly validating function call chains.",
+                           FileName,
+                           CodeIssue.MEDIUM)
+        End If
+
+        ' Update input validation status
+        If CodeLine.Contains("instanceof") Or
+       CodeLine.Contains("getClass().getName()") Or
+       CodeLine.Contains("validateObject(") Or
+       CodeLine.Contains("ObjectInputValidation") Then
+            ctCodeTracker.HasInputValidation = True
+        End If
+    End Sub
+
 
 End Module

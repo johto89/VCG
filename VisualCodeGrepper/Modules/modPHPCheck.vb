@@ -27,16 +27,17 @@ Module modPHPCheck
         ' Carry out any specific checks for the language in question
         '===========================================================
 
-        CheckSQLInjection(CodeLine, FileName)           ' Check for SQLi
-        CheckXSS(CodeLine, FileName)                    ' Check for XSS
-        CheckLogDisplay(CodeLine, FileName)             ' Is data sanitised before being written to logs?
-        CheckRandomisation(CodeLine, FileName)          ' Locate any use of randomisation functions that are not cryptographically secure
-        CheckFileValidation(CodeLine, FileName)         ' Find any unsafe file validation (checks against data from the HTTP request *instead of* the actual file
-        CheckFileInclusion(CodeLine, FileName)          ' Locate any include files with unsafe extensions
-        CheckExecutable(CodeLine, FileName)             ' Check for unvalidated variables being executed via cmd line/system calls
-        CheckBackTick(CodeLine, FileName)               ' Check for user-supplied variables being executed on the cmdline due to backtick usage
-        CheckRegisterGlobals(CodeLine, FileName)        ' Check for usage or simulation of register_globals
-        CheckParseStr(CodeLine, FileName)               ' Check for any unsafe usage of parse_str
+        CheckSQLInjection(CodeLine, FileName)               ' Check for SQLi
+        CheckXSS(CodeLine, FileName)                        ' Check for XSS
+        CheckLogDisplay(CodeLine, FileName)                 ' Is data sanitised before being written to logs?
+        CheckRandomisation(CodeLine, FileName)              ' Locate any use of randomisation functions that are not cryptographically secure
+        CheckFileValidation(CodeLine, FileName)             ' Find any unsafe file validation (checks against data from the HTTP request *instead of* the actual file
+        CheckFileInclusion(CodeLine, FileName)              ' Locate any include files with unsafe extensions
+        CheckExecutable(CodeLine, FileName)                 ' Check for unvalidated variables being executed via cmd line/system calls
+        CheckBackTick(CodeLine, FileName)                   ' Check for user-supplied variables being executed on the cmdline due to backtick usage
+        CheckRegisterGlobals(CodeLine, FileName)            ' Check for usage or simulation of register_globals
+        CheckParseStr(CodeLine, FileName)                   ' Check for any unsafe usage of parse_str
+        CheckInsecureDeserialization(CodeLine, FileName)    ' Check for insecure deserialization vulnerabilities
 
         '== Check for passwords being handled in a case-insensitive manner ==
         If Regex.IsMatch(CodeLine, "(strtolower|strtoupper)\s*\(\s*\S*(Password|password|pwd|PWD|Pwd|Passwd|passwd)") Then
@@ -346,32 +347,147 @@ Module modPHPCheck
             rtResultsTracker.OverallWhitespaceCount += 1
             rtResultsTracker.WhitespaceCount += 1
         Else
-
+            ' Check for dangerous settings
             If Regex.IsMatch(CodeLine, "\bregister_globals\b\s*=\s*\b(on|ON|On)\b") Then
-                ' register_globals
                 frmMain.ListCodeIssue("Use of 'register_globals'", "The application appears to activate the use of the dangerous 'register_globals' facility. Anything passed via GET or POST or COOKIE is automatically assigned as a global variable in the code, with potentially serious consequences.", FileName, CodeIssue.CRITICAL, CodeLine)
+
             ElseIf Regex.IsMatch(CodeLine, "\bsafe_mode\b\s*=\s*\b(off|OFF|Off)\b") Then
-                ' safe_mode
                 frmMain.ListCodeIssue("De-Activation of 'safe_mode'", "The application appears to de-activate the use of 'safe_mode', which can increase risks for any CGI-based applications.", FileName, CodeIssue.MEDIUM, CodeLine)
+
             ElseIf Regex.IsMatch(CodeLine, "\b(magic_quotes_gpc|magic_quotes_runtime|magic_quotes_sybase)\b\s*=\s*\b(off|OFF|Off)\b") Then
-                ' magic_quotes
                 frmMain.ListCodeIssue("De-Activation of 'magic_quotes'", "The application appears to de-activate the use of 'magic_quotes', greatly increasing the risk of SQL injection.", FileName, CodeIssue.HIGH, CodeLine)
-            ElseIf Regex.IsMatch(CodeLine, "\bdisable_functions\b\s*=\s*\w+") Then
-                ' Is disable_functions being used?
-                ctCodeTracker.HasDisableFunctions = True
+
+            ElseIf Regex.IsMatch(CodeLine, "\bdisable_functions\b\s*=\s*([\w, ]+)", RegexOptions.IgnoreCase) Then
+                Dim disabledFunctions As String = Regex.Match(CodeLine, "\bdisable_functions\b\s*=\s*([\w, ]+)").Groups(1).Value
+                If Not disabledFunctions.Contains("phpinfo") AndAlso Not disabledFunctions.Contains("system") Then
+                    frmMain.ListCodeIssue("Inadequate 'disable_functions'", "Consider adding 'phpinfo' and 'system' to disable_functions to enhance security.", FileName, CodeIssue.MEDIUM, CodeLine)
+                End If
+
             ElseIf Regex.IsMatch(CodeLine, "\bmysql.default_user\b\s*=\s*\broot\b") Then
-                ' Log in to MySQL as 'root'?
                 frmMain.ListCodeIssue("Log in to MySQL as 'root'", "The application appears to log in to MySQL as 'root', greatly increasing the consequences of a successful SQL injection attack.", FileName, CodeIssue.HIGH, CodeLine)
+
+            ElseIf Regex.IsMatch(CodeLine, "\b(expose_php)\b\s*=\s*\b(on|ON|On)\b") Then
+                frmMain.ListCodeIssue("Exposure of PHP info", "The application appears to expose PHP version information. Set 'expose_php' to Off to increase security.", FileName, CodeIssue.MEDIUM, CodeLine)
+
+            ElseIf Regex.IsMatch(CodeLine, "\b(display_errors)\b\s*=\s*\b(on|ON|On)\b") Then
+                frmMain.ListCodeIssue("Displaying errors to users", "Displaying errors to end-users can leak sensitive information. Set 'display_errors' to Off.", FileName, CodeIssue.HIGH, CodeLine)
+
+            ElseIf Regex.IsMatch(CodeLine, "\bfile_uploads\b\s*=\s*\b(on|ON|On)\b") Then
+                frmMain.ListCodeIssue("Allowing file uploads", "File uploads should be turned Off if not used by the application. This reduces the risk of file upload vulnerabilities.", FileName, CodeIssue.MEDIUM, CodeLine)
+
+            ElseIf Regex.IsMatch(CodeLine, "\ballow_url_fopen\b\s*=\s*\b(on|ON|On)\b") Then
+                frmMain.ListCodeIssue("Remote file access", "Enabling 'allow_url_fopen' can lead to Local File Inclusion (LFI) vulnerabilities. Consider setting it to Off.", FileName, CodeIssue.HIGH, CodeLine)
+
+            ElseIf Regex.IsMatch(CodeLine, "\bmax_execution_time\b\s*=\s*\d+") Then
+                Dim executionTime As Integer = Integer.Parse(Regex.Match(CodeLine, "\bmax_execution_time\b\s*=\s*(\d+)").Groups(1).Value)
+                If executionTime > 30 Then
+                    frmMain.ListCodeIssue("Excessive max_execution_time", "Consider reducing 'max_execution_time' to a maximum of 30 seconds to prevent denial of service attacks.", FileName, CodeIssue.MEDIUM, CodeLine)
+                End If
+
+            ElseIf Regex.IsMatch(CodeLine, "\bmemory_limit\b\s*=\s*[\d]+M") Then
+                Dim memoryLimit As Integer = Integer.Parse(Regex.Match(CodeLine, "\bmemory_limit\b\s*=\s*(\d+)M").Groups(1).Value)
+                If memoryLimit > 8 Then
+                    frmMain.ListCodeIssue("High memory_limit", "Consider lowering 'memory_limit' to 8M for better resource management.", FileName, CodeIssue.MEDIUM, CodeLine)
+                End If
+
+                ' New checks for session-related settings
+            ElseIf Regex.IsMatch(CodeLine, "\bsession.cookie_httponly\b\s*=\s*\b(off|OFF|Off)\b") Then
+                frmMain.ListCodeIssue("HTTPOnly Cookies", "Consider setting 'session.cookie_httponly' to 1 to prevent access to cookies via JavaScript.", FileName, CodeIssue.MEDIUM, CodeLine)
+
+            ElseIf Regex.IsMatch(CodeLine, "\bsession.use_strict_mode\b\s*=\s*\b(off|OFF|Off)\b") Then
+                frmMain.ListCodeIssue("Session Fixation Protection", "Consider setting 'session.use_strict_mode' to 1 to protect against session fixation attacks.", FileName, CodeIssue.MEDIUM, CodeLine)
+
+            ElseIf Regex.IsMatch(CodeLine, "\bsession.cookie_secure\b\s*=\s*\b(off|OFF|Off)\b") Then
+                frmMain.ListCodeIssue("Secure Cookies", "Consider setting 'session.cookie_secure' to 1 to ensure cookies are transmitted only over HTTPS.", FileName, CodeIssue.MEDIUM, CodeLine)
+
+            ElseIf Regex.IsMatch(CodeLine, "\bsession.cookie_samesite\b\s*=\s*[^Strict]") Then
+                frmMain.ListCodeIssue("SameSite Cookies", "Consider setting 'session.cookie_samesite' to 'Strict' to help prevent cross-origin attacks.", FileName, CodeIssue.MEDIUM, CodeLine)
+
+            ElseIf Regex.IsMatch(CodeLine, "\bsession.use_trans_sid\b\s*=\s*\b(on|ON|On)\b") Then
+                frmMain.ListCodeIssue("Trans SID Usage", "Setting 'session.use_trans_sid' to 1 can expose your application to security risks. Set it to 0.", FileName, CodeIssue.MEDIUM, CodeLine)
+
+            ElseIf Regex.IsMatch(CodeLine, "\bsession.sid_length\b\s*=\s*\d+") Then
+                Dim sidLength As Integer = Integer.Parse(Regex.Match(CodeLine, "\bsession.sid_length\b\s*=\s*(\d+)").Groups(1).Value)
+                If sidLength < 128 Then
+                    frmMain.ListCodeIssue("Short Session ID Length", "Consider increasing 'session.sid_length' to at least 128 to enhance security.", FileName, CodeIssue.MEDIUM, CodeLine)
+                End If
+
+            ElseIf Regex.IsMatch(CodeLine, "\bsession.sid_bits_per_character\b\s*=\s*\d+") Then
+                Dim sidBits As Integer = Integer.Parse(Regex.Match(CodeLine, "\bsession.sid_bits_per_character\b\s*=\s*(\d+)").Groups(1).Value)
+                If sidBits < 6 Then
+                    frmMain.ListCodeIssue("Low SID Bits per Character", "Consider increasing 'session.sid_bits_per_character' to at least 6 to improve randomness.", FileName, CodeIssue.MEDIUM, CodeLine)
+                End If
+
             End If
 
             rtResultsTracker.OverallCodeCount += 1
             rtResultsTracker.CodeCount += 1
-
         End If
 
         rtResultsTracker.OverallLineCount += 1
         rtResultsTracker.LineCount += 1
-
     End Sub
+
+    Private Sub CheckInsecureDeserialization(CodeLine As String, FileName As String)
+        ' Check for insecure deserialization vulnerabilities
+        '==================================================
+
+        ' Define patterns for PHP deserialization methods
+        Dim deserializationPatterns As New List(Of String) From {
+        "unserialize\(",
+        "json_decode\(",
+        "xml_decode\("
+    }
+
+        ' Check for actual use of insecure deserialization APIs (not just imports)
+        If deserializationPatterns.Any(Function(p) System.Text.RegularExpressions.Regex.IsMatch(CodeLine, p)) Then
+            ' Ensure input validation exists before deserialization
+            If Not ctCodeTracker.HasInputValidation Then
+                frmMain.ListCodeIssue("Potential Insecure Deserialization",
+                               "Using deserialization methods or APIs without apparent input validation.",
+                               FileName,
+                               CodeIssue.MEDIUM) ' Changed to Medium severity
+            End If
+        End If
+
+        ' Check for custom deserialization methods
+        If Regex.IsMatch(CodeLine, "function\s+customDeserialize\(") Then
+            frmMain.ListCodeIssue("Custom Deserialization Implementation",
+                           "Detected custom deserialization methods. Ensure input validation and type checking.",
+                           FileName,
+                           CodeIssue.MEDIUM)
+        End If
+
+        ' Check for use of unserialize() with user-controlled data
+        If Regex.IsMatch(CodeLine, "unserialize\(\s*\$") Then
+            frmMain.ListCodeIssue("Use of unserialize()",
+                           "unserialize() may lead to code execution if data is user-controlled.",
+                           FileName,
+                           CodeIssue.HIGH)
+        End If
+
+        ' Check for gadget chains in deserialization
+        Dim gadgetPatterns As New List(Of String) From {
+        "var_dump\(",         ' Example of a potential gadget
+        "system\(",          ' Command execution function
+        "shell_exec\(",      ' Command execution via shell
+        "eval\("             ' Execution of PHP code
+    }
+
+        If gadgetPatterns.Any(Function(p) CodeLine.Contains(p)) Then
+            frmMain.ListCodeIssue("Potential Gadget Chain",
+                           "Detected potential gadget chain that may lead to security issues. Validate function calls thoroughly.",
+                           FileName,
+                           CodeIssue.MEDIUM)
+        End If
+
+        ' Update input validation status based on content
+        If CodeLine.Contains("isset(") Or
+       CodeLine.Contains("empty(") Or
+       CodeLine.Contains("filter_input(") Then
+            ctCodeTracker.HasInputValidation = True
+        End If
+    End Sub
+
 
 End Module
