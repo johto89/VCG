@@ -189,6 +189,8 @@ Public Class CodeTracker
     '=============================================================
     Dim reRegex As Regex
 
+    ' Property to track if input validation is present
+    Public Property HasInputValidation As Boolean
 
     Public Sub New()
         'Initialise variables
@@ -196,6 +198,7 @@ Public Class CodeTracker
 
         Reset()
         ResetCDictionaries()
+        HasInputValidation = False ' Default value
 
     End Sub
 

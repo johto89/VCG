@@ -3266,6 +3266,9 @@ Public Class frmMain
 
     End Sub
 
+    Private Sub mnuMain_ItemClicked(sender As Object, e As ToolStripItemClickedEventArgs) Handles mnuMain.ItemClicked
+
+    End Sub
 End Class
 
 
