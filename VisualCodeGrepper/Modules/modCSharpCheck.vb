@@ -47,12 +47,26 @@ Module modCSharpCheck
         CheckExecutable(CodeLine, FileName)             ' Check for unvalidated variables being executed via cmd line/system calls
         CheckWebConfig(CodeLine, FileName)              ' Check config file to determine whether .NET debugging and default errors are enabled
         CheckProcessInjection(CodeLine, FileName)       ' Check for potential process injection or hollowing techniques
+        CheckMisconfiguredRoutes(CodeLine, FileName)    ' Check for potential misconfigured routes or connection strings
 
         If Regex.IsMatch(CodeLine, "\S*(Password|password|pwd|passwd)\S*(\.|\-\>)(ToLower|ToUpper)\s*\(") Then
             frmMain.ListCodeIssue("Unsafe Password Management", "The application appears to handle passwords in a case-insensitive manner. This can greatly increase the likelihood of successful brute-force and/or dictionary attacks.", FileName, CodeIssue.MEDIUM, CodeLine)
         End If
 
     End Sub
+
+    Public Enum Rules
+        MapControllerRoute   ' Identifies the use of MapControllerRoute, which is used to configure routes in ASP.NET MVC.
+        MapHttpRoute         ' Identifies the use of MapHttpRoute, which configures Web API routes. It might expose sensitive routes if misconfigured.
+        MapPageRoute         ' Detects usage of MapPageRoute, which configures routing for WebForms pages. Hardcoded routes might be a security concern.
+        MapRoute             ' Checks for MapRoute, used to define routing in MVC. Possible hardcoded routes should be reviewed.
+        CreateRoute          ' Detects the use of CreateRoute, which might create routes dynamically but can expose sensitive paths.
+        MapGet               ' Detects MapGet, used in minimal APIs to handle HTTP GET requests. Should check for any unsafe path configurations.
+        MapPost              ' Detects MapPost, used in minimal APIs to handle HTTP POST requests. Needs to ensure data validation on POST.
+        HttpGet              ' Detects HttpGet, which marks an action as responding to GET requests. Watch for information exposure via query strings.
+        HttpPost             ' Detects HttpPost, which marks an action as responding to POST requests. Ensure proper validation to avoid data leaks.
+        connectionString     ' Detects hardcoded connection strings. Hardcoded database connection strings should be replaced with secure alternatives like configuration files or environment variables.
+    End Enum
 
     Public Sub IdentifyLabels(CodeLine As String, FileName As String)
         ' Locate and record any labels in asp pages. These will be checked for XSS later.
@@ -97,7 +111,7 @@ Module modCSharpCheck
         ' Check for presence of file upload elements and functions in both ASP.NET Web Forms and ASP.NET Core
         If CodeLine.Contains("Request.Files") Or CodeLine.Contains("HttpPostedFileBase") Or
             CodeLine.Contains("FileUpload") Or CodeLine.Contains("UploadFile") Or CodeLine.Contains("SaveAs") Or
-            CodeLine.Contains("IFormFile") Or CodeLine.Contains("Request.Form.Files") Then
+            CodeLine.Contains("IFormFile") Or CodeLine.Contains("Request.Form.Files") Or CodeLine.Contains("(MapPath") Then
             isUploadFunctionPresent = True
         End If
 
@@ -446,6 +460,13 @@ Module modCSharpCheck
             End If
         End If
 
+        ' Check for TypeNameHandling usage in JsonConvert.DeserializeObject
+        If Regex.IsMatch(CodeLine, "JsonConvert\.DeserializeObject\s*\(.*,\s*new\s+JsonSerializerSettings\s*\(\)\s*{\s*TypeNameHandling\s*=\s*TypeNameHandling\.All\s*\}\s*\)") Then
+            frmMain.ListCodeIssue("Deserialization Risk", "TypeNameHandling is set to All, which may allow unsafe type resolution and deserialization attacks. Consider using None or Objects with strict type controls.", FileName, CodeIssue.CRITICAL, CodeLine)
+        ElseIf Regex.IsMatch(CodeLine, "JsonConvert\.DeserializeObject\s*\(.*,\s*new\s+JsonSerializerSettings\s*\(\)\s*{\s*TypeNameHandling\s*=\s*TypeNameHandling\.Objects\s*\}\s*\)") Then
+            frmMain.ListCodeIssue("Deserialization Risk", "TypeNameHandling is set to Objects, which may allow unsafe deserialization attacks. Ensure that untrusted input is not allowed.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
         ' Check for serialization
         If ctCodeTracker.IsSerializable = False And CodeLine.Contains("using System.Runtime.Serialization") Then
             ' Serialization is implemented in the code module
@@ -469,6 +490,7 @@ Module modCSharpCheck
         End If
 
     End Sub
+
 
     Public Sub CheckHTTPRedirect(CodeLine As String, FileName As String)
         ' Check for safe use HTTP redirects and potential open redirect vulnerabilities
@@ -904,6 +926,43 @@ Module modCSharpCheck
             frmMain.ListCodeIssue("Renamed ASP.NET Identity Cookie", "ASP.NET Identity cookie has been renamed to obscure technology stack.", FileName, CodeIssue.LOW)
 
         End If
+    End Sub
+
+    Private Sub CheckMisconfiguredRoutes(CodeLine As String, FileName As String)
+        ' Check for potential misconfigured routes or connection strings
+        ' =============================================================
+
+        ' Create a dictionary containing regex patterns and corresponding warning messages
+        Dim rulesDictionary As New Dictionary(Of Rules, String) From {
+        {Rules.MapControllerRoute, "Potential misconfigured route: MapControllerRoute"},
+        {Rules.MapHttpRoute, "Potential misconfigured route: MapHttpRoute"},
+        {Rules.MapPageRoute, "Potential misconfigured route: MapPageRoute"},
+        {Rules.MapRoute, "Potential misconfigured route: MapRoute"},
+        {Rules.CreateRoute, "Potential misconfigured route: CreateRoute"},
+        {Rules.MapGet, "Potential misconfigured HTTP GET: MapGet"},
+        {Rules.MapPost, "Potential misconfigured HTTP POST: MapPost"},
+        {Rules.HttpGet, "Use of HTTP GET detected, verify it does not expose sensitive data"},
+        {Rules.HttpPost, "Use of HTTP POST detected, ensure proper input validation"},
+        {Rules.connectionString, "Potential hardcoded connection string detected"}
+    }
+
+        ' Loop through each rule and check against the code line
+        For Each rule In rulesDictionary.Keys
+            Dim pattern As String = ""
+
+            ' Create the regular expression pattern based on the rule
+            Select Case rule
+                Case Rules.MapControllerRoute, Rules.MapHttpRoute, Rules.MapPageRoute, Rules.MapRoute, Rules.CreateRoute, Rules.MapGet, Rules.MapPost, Rules.HttpGet, Rules.HttpPost
+                    pattern = "\b" & rule.ToString() & "\("
+                Case Rules.connectionString
+                    pattern = "connectionString=\"""
+            End Select
+
+            ' Check if the code line matches the pattern
+            If Regex.IsMatch(CodeLine, pattern) Then
+                frmMain.ListCodeIssue("Potential Misconfiguration Detected", rulesDictionary(rule), FileName, CodeIssue.MEDIUM, CodeLine)
+            End If
+        Next
     End Sub
 
 End Module

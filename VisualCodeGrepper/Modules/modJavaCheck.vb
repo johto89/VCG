@@ -20,6 +20,8 @@ Imports System.Text.RegularExpressions
 
 Module modJavaCheck
 
+    Private ctCodeTracker As New CodeTracker()
+
     ' Specific checks for Java code
     '==============================
 
@@ -43,7 +45,7 @@ Module modJavaCheck
         CheckUnsafeTempFiles(CodeLine, FileName)            ' Check for temp files with obvious names
         CheckPrivileged(CodeLine, FileName)                 ' Check for potential user access to code with system privileges
         CheckRequestDispatcher(CodeLine, FileName)          ' Check for user control of request dispatcher
-        CheckXXEExpansion(CodeLine, FileName)               ' Check for safe/unsafe XML expansion
+        CheckXXE(CodeLine, FileName)               ' Check for safe/unsafe XML expansion
         CheckOverflow(CodeLine, FileName)                   ' Check use of primitive types and any operations upon them
         CheckResourceRelease(CodeLine, FileName)            ' Are file resources safely handled in try ... catch blocks
         CheckInsecureDeserialization(CodeLine, FileName)    ' Check for insecure deserialization vulnerabilities
@@ -107,7 +109,7 @@ Module modJavaCheck
             '== Extract variable name from assignment statement ==
             strVarName = GetVarName(CodeLine)
             ctCodeTracker.HasVulnSQLString = True
-            If Not ctCodeTracker.SQLStatements.Contains(strVarName) And _
+            If Not ctCodeTracker.SQLStatements.Contains(strVarName) And
                 (Not (strVarName.Contains("(") Or strVarName.Contains(")") Or strVarName.Contains("[") Or strVarName.Contains("]") Or strVarName.Contains(" ") Or strVarName.Contains("+") Or strVarName.Contains("*"))) Then ctCodeTracker.SQLStatements.Add(strVarName)
         End If
 
@@ -666,23 +668,62 @@ Module modJavaCheck
 
     End Sub
 
-    Private Sub CheckXXEExpansion(CodeLine As String, FileName As String)
-        ' Determine whether XML expansion is possible and check feasibility of XML-Bomb delivery
-        '=======================================================================================
+    Private Sub CheckXXE(CodeLine As String, FileName As String)
+        ' Check for potential XXE vulnerabilities in XML parsing code
+        '===========================================================
 
-        '== Check for use of XXE parser ==
-        If ctCodeTracker.HasXXEEnabled = False And Regex.IsMatch(CodeLine, "import\s+javax\.xml\.bind\.JAXB\s*\;") Then ctCodeTracker.HasXXEEnabled = True
-
-        If ctCodeTracker.HasXXEEnabled = True And Regex.IsMatch(CodeLine, "\(\s*(XMLConstants\.FEATURE_SECURE_PROCESSING|XMLInputFactory.SUPPORT_DTD)\s*\,\s*false\s*\)") Then
-            '== Deliberate setting of entity expansion ==
-            frmMain.ListCodeIssue("XML Entity Expansion Enabled", "The FEATURE_SECURE_PROCESSING attribute is set to false which can render the application vulnerable to the use of XML bombs. Check the necessity of enabling this feature and check for validation of incoming data.", FileName, CodeIssue.HIGH, CodeLine)
-        ElseIf ctCodeTracker.HasXXEEnabled = True And Regex.IsMatch(CodeLine, "\(\s*(XMLConstants\.FEATURE_SECURE_PROCESSING|XMLInputFactory.SUPPORT_DTD)\s*\,\s*true\s*\)") Then
-            '== Security settings have been applied ==
-            ctCodeTracker.HasXXEEnabled = False
-        ElseIf ctCodeTracker.HasXXEEnabled = True Then
-
+        ' Use a regular expression to check for import of JAXB
+        If Not ctCodeTracker.HasXXEEnabled Then
+            If Regex.IsMatch(CodeLine, "import\s+javax\.xml\.bind\.JAXB\s*;") Then
+                ctCodeTracker.HasXXEEnabled = True
+                ctCodeTracker.VulnerableLines.Add(CodeLine) ' Record the vulnerable line
+                frmMain.ListCodeIssue("Potential XXE Vulnerability",
+                                   "Detected use of JAXB, which may lead to XXE.",
+                                   FileName)
+            End If
         End If
 
+        ' If JAXB has been detected, check for other factors
+        If ctCodeTracker.HasXXEEnabled Then
+            ' Check for insecure XML processing features
+            If Regex.IsMatch(CodeLine, "\(\s*(XMLConstants\.FEATURE_SECURE_PROCESSING|XMLInputFactory\.SUPPORT_DTD)\s*\,\s*false\s*\)") Then
+                ctCodeTracker.VulnerableLines.Add(CodeLine) ' Record the vulnerable line
+                frmMain.ListCodeIssue("Insecure XML Processing",
+                                   "XML processing features are set to false, which may lead to XXE.",
+                                   FileName)
+            End If
+
+            ' Check for use of other XML parsers
+            If Regex.IsMatch(CodeLine, "\b(DocumentBuilderFactory|SAXParserFactory|DOM4J|XMLInputFactory|XMLReader|parseXml)\b") Then
+                ctCodeTracker.VulnerableLines.Add(CodeLine) ' Record the vulnerable line
+                frmMain.ListCodeIssue("Use of XML Parser",
+                                   "Detected use of an XML parser that may be vulnerable to XXE.",
+                                   FileName)
+            End If
+        End If
+
+        ' Check for external entity declarations in XML strings
+        If InStr(1, CodeLine, "<!doctype", vbTextCompare) > 0 OrElse
+       InStr(1, CodeLine, "<!ENTITY", vbTextCompare) > 0 Then
+            ctCodeTracker.VulnerableLines.Add(CodeLine) ' Record the vulnerable line
+            frmMain.ListCodeIssue("Possible XXE Payload",
+                               "XML contains doctype or entity declarations, which may lead to XXE attacks.",
+                               FileName)
+        End If
+
+        ' Check for the use of external entity resolution settings
+        If InStr(1, CodeLine, "setProperty", vbTextCompare) > 0 AndAlso
+       (InStr(1, CodeLine, "javax.xml.XMLConstants.ACCESS_EXTERNAL_DTD", vbTextCompare) > 0 OrElse
+        InStr(1, CodeLine, "javax.xml.XMLConstants.ACCESS_EXTERNAL_SCHEMA", vbTextCompare) > 0) Then
+
+            If Not (InStr(1, CodeLine, "ACCESS_EXTERNAL_DTD", vbTextCompare) > 0 AndAlso
+                InStr(1, CodeLine, "ACCESS_EXTERNAL_SCHEMA", vbTextCompare) > 0) Then
+                ctCodeTracker.VulnerableLines.Add(CodeLine) ' Record the vulnerable line
+                frmMain.ListCodeIssue("Improper External Entity Access Configuration",
+                                   "XML parser configuration does not restrict external DTD/schema access.",
+                                   FileName)
+            End If
+        End If
     End Sub
 
     Private Sub CheckOverflow(CodeLine As String, FileName As String)

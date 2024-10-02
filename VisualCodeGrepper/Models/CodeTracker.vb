@@ -22,7 +22,7 @@ Public Class CodeTracker
     ' other issues which require checks from multiple lines 
     ' throughout the file.
     '===============================================================
-
+    Public Property VulnerableLines As List(Of String)
 
     '==================================================
     ' Constants to identify usages of sizeof in strncpy
@@ -198,6 +198,7 @@ Public Class CodeTracker
 
         Reset()
         ResetCDictionaries()
+        VulnerableLines = New List(Of String)()
         HasInputValidation = False ' Default value
 
     End Sub

@@ -38,6 +38,8 @@ Module modPHPCheck
         CheckRegisterGlobals(CodeLine, FileName)            ' Check for usage or simulation of register_globals
         CheckParseStr(CodeLine, FileName)                   ' Check for any unsafe usage of parse_str
         CheckInsecureDeserialization(CodeLine, FileName)    ' Check for insecure deserialization vulnerabilities
+        CheckXXE(CodeLine, FileName)                        ' Check for potential XXE vulnerabilities 
+        CheckStreamFilters(CodeLine, FileName)              ' Check for unsafe usage of stream filters like zlib.inflate and dechunk
 
         '== Check for passwords being handled in a case-insensitive manner ==
         If Regex.IsMatch(CodeLine, "(strtolower|strtoupper)\s*\(\s*\S*(Password|password|pwd|PWD|Pwd|Passwd|passwd)") Then
@@ -46,29 +48,52 @@ Module modPHPCheck
 
     End Sub
 
+    Private Sub CheckStreamFilters(CodeLine As String, FileName As String)
+        ' Check for unsafe usage of stream filters like zlib.inflate and dechunk
+        '=========================================================
+
+        ' Check for the presence of zlib.inflate
+        If Regex.IsMatch(CodeLine, "\bzlib\.inflate\b", RegexOptions.IgnoreCase) Then
+            frmMain.ListCodeIssue("Unsafe Usage of zlib.inflate", "The application uses zlib.inflate, which may lead to heap manipulation and buffer overflows if not handled properly.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        ' Check for the presence of dechunk
+        If Regex.IsMatch(CodeLine, "\bdechunk\b", RegexOptions.IgnoreCase) Then
+            frmMain.ListCodeIssue("Unsafe Usage of dechunk", "The application uses dechunk, which may lead to potential vulnerabilities if not validated or sanitized appropriately.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        ' Additional checks can be added here for any other stream filters if necessary.
+    End Sub
+
+
     Private Sub CheckSQLInjection(CodeLine As String, FileName As String)
         ' Check for any SQL injection problems 
         '=====================================
         Dim strVarName As String = ""   ' Holds the variable name for the dynamic SQL statement
 
-
         '== Only check unvalidated code ==
         If ctCodeTracker.HasValidator = True Then Exit Sub
 
-
         '== Is unsanitised dynamic SQL statement prepared beforehand? ==
-        If CodeLine.Contains("=") And (CodeLine.ToLower.Contains("sql") Or CodeLine.ToLower.Contains("query") Or CodeLine.ToLower.Contains("stmt") Or CodeLine.ToLower.Contains("query")) And (CodeLine.Contains("""") And (CodeLine.Contains("$") Or CodeLine.Contains("+"))) Then
+        If CodeLine.Contains("=") AndAlso
+           (CodeLine.ToLower.Contains("sql") OrElse
+            CodeLine.ToLower.Contains("query") OrElse
+            CodeLine.ToLower.Contains("stmt") OrElse
+            CodeLine.ToLower.Contains("query")) AndAlso
+           (CodeLine.Contains("""") AndAlso (CodeLine.Contains("$") OrElse CodeLine.Contains("+"))) Then
             '== Extract variable name from assignment statement ==
             strVarName = GetVarName(CodeLine)
             ctCodeTracker.HasVulnSQLString = True
-            If Regex.IsMatch(strVarName, "^\$[a-zA-Z0-9_]*$") And Not ctCodeTracker.SQLStatements.Contains(strVarName) Then ctCodeTracker.SQLStatements.Add(strVarName)
+            If Regex.IsMatch(strVarName, "^\$[a-zA-Z0-9_]*$") AndAlso Not ctCodeTracker.SQLStatements.Contains(strVarName) Then
+                ctCodeTracker.SQLStatements.Add(strVarName)
+            End If
         End If
 
-
-        If Regex.IsMatch(CodeLine, "validate|encode|sanitize|sanitise") Then
+        ' Check for sanitization methods
+        If Regex.IsMatch(CodeLine, "validate|encode|sanitize|sanitise", RegexOptions.IgnoreCase) Then
             '== Remove any variables which have been sanitised from the list of vulnerable variables ==  
             RemoveSanitisedVars(CodeLine)
-        ElseIf Regex.IsMatch(CodeLine, "(mysql_query|mssql_query|pg_query)\s*\(") And Not Regex.IsMatch(CodeLine, "mysql_real_escape_string") Then
+        ElseIf Regex.IsMatch(CodeLine, "(mysql_query|mssql_query|pg_query)\s*\(", RegexOptions.IgnoreCase) AndAlso Not Regex.IsMatch(CodeLine, "mysql_real_escape_string", RegexOptions.IgnoreCase) Then
 
             If ctCodeTracker.HasVulnSQLString = True Then
                 '== Check for use of pre-prepared statements ==
@@ -81,11 +106,27 @@ Module modPHPCheck
             ElseIf CodeLine.Contains("$") Then
                 '== Dynamic SQL built into connection/update ==
                 frmMain.ListCodeIssue("Potential SQL Injection", "The application appears to allow SQL injection via dynamic SQL statements.", FileName, CodeIssue.CRITICAL, CodeLine)
-
             End If
         End If
 
+        ' New rules for additional SQL injection patterns
+        If Regex.IsMatch(CodeLine, "\->(query|exec)\(\s*""[^""]*""\s*\)", RegexOptions.IgnoreCase) Then
+            frmMain.ListCodeIssue("Potential SQL Injection", "The application appears to allow SQL injection via dynamic method calls.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "query\((.*?)\)", RegexOptions.IgnoreCase) Then
+            frmMain.ListCodeIssue("Potential SQL Injection", "The application appears to allow SQL injection via direct query execution.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "query\(.*\)\s*=", RegexOptions.IgnoreCase) Then
+            frmMain.ListCodeIssue("Potential SQL Injection", "The application appears to allow SQL injection via assignment to a query.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "sql\(.*\)\s*=", RegexOptions.IgnoreCase) Then
+            frmMain.ListCodeIssue("Potential SQL Injection", "The application appears to allow SQL injection via assignment to SQL statements.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
     End Sub
+
 
     Private Sub CheckXSS(CodeLine As String, FileName As String)
         ' Check for any XSS problems 
@@ -99,14 +140,14 @@ Module modPHPCheck
         If Regex.IsMatch(CodeLine, "validate|encode|sanitize|sanitise") Then
             '== Remove any variables which have been sanitised from the list of vulnerable variables ==  
             RemoveSanitisedVars(CodeLine)
-        ElseIf Regex.IsMatch(CodeLine, "\$\w+\s*\=\s*\$_(GET|POST|COOKIE|REQUEST|SERVER)") Then
+        ElseIf Regex.IsMatch(CodeLine, "\$\w+\s*\=\s*\$_(Get|POST|COOKIE|REQUEST|SERVER)") Then
             '== Extract variable name from assignment statement ==
             strVarName = GetVarName(CodeLine)
             If Regex.IsMatch(strVarName, "^\\\$[a-zA-Z0-9_]*$") And Not ctCodeTracker.InputVars.Contains(strVarName) Then ctCodeTracker.InputVars.Add(strVarName)
         ElseIf Regex.IsMatch(CodeLine, "\b(print|echo|print_r)\b") And CodeLine.Contains("$") And Not Regex.IsMatch(CodeLine, "strip_tags") Then
-            CheckUserVarXSS(CodeLine, FileName)
+        CheckUserVarXSS(CodeLine, FileName)
         ElseIf Regex.IsMatch(CodeLine, "\b(print|echo|print_r)\b\s*\$_(GET|POST|COOKIE|REQUEST|SERVER)") And Not Regex.IsMatch(CodeLine, "strip_tags") Then
-            frmMain.ListCodeIssue("Potential XSS", "The application appears to reflect a user-supplied variable to the screen with no apparent validation or sanitisation.", FileName, CodeIssue.HIGH, CodeLine)
+        frmMain.ListCodeIssue("Potential XSS", "The application appears to reflect a user-supplied variable to the screen with no apparent validation or sanitisation.", FileName, CodeIssue.HIGH, CodeLine)
         End If
 
         '== Check for DOM-based XSS in .php pages ==
@@ -181,10 +222,10 @@ Module modPHPCheck
         Dim blnIsFound As Boolean = False
 
         '== Identify relevant 'include' statements ==
-        If Regex.IsMatch(CodeLine, "\b(file_include|include|require|include_once|require_once)\b\s*\(\s*\$") Then
+        If Regex.IsMatch(CodeLine, "\b(file_include|include_once|require_once)\b\s*\(\s*\$") Then
             '== Check for use of user-defined variables ==
             For Each strVar In ctCodeTracker.InputVars
-                If Regex.IsMatch(CodeLine, "\b(file_include|include|require|include_once|require_once)\b\s*\(\s*" & strVar) Or Regex.IsMatch(CodeLine, "\b(file_include|include|require|include_once|require_once)\b\s*\(\s*\w+\s*\.\s*" & strVar) Then
+                If Regex.IsMatch(CodeLine, "\b(file_include|include_once|require_once)\b\s*\(\s*" & strVar) Or Regex.IsMatch(CodeLine, "\b(file_include|include_once|require_once)\b\s*\(\s*\w+\s*\.\s*" & strVar) Then
                     frmMain.ListCodeIssue("File Inclusion Vulnerability", "The code appears to use a user-controlled variable as a parameter for an include statement which could lead to a file include vulnerability.", FileName, CodeIssue.HIGH, CodeLine)
                     blnIsFound = True
                     Exit For
@@ -193,14 +234,19 @@ Module modPHPCheck
             If blnIsFound = False Then
                 frmMain.ListCodeIssue("Variable Used as FileName", "The application appears to use a variable name in order to define a filename used by the application. It is unclear whether this variable can be controlled by the user - carry out a manual inspection to confirm.", FileName, CodeIssue.LOW, CodeLine)
             End If
-        ElseIf Regex.IsMatch(CodeLine, "\b(file_include|include|require|include_once|require_once)\b\s*\(\s*(\'|\"")\w+\.(inc|txt|dat)") Then
+        ElseIf Regex.IsMatch(CodeLine, "\b(file_include|include_once|require_once)\b\s*\(\s*(\'|\"")\w+\.(inc|txt|dat)") Then
             '== Check for use of unsafe extensions ==
             frmMain.ListCodeIssue("File Inclusion Vulnerability", "The code appears to use an unsafe file extension for an include statement which could allow an attacker to download it directly and read the uncompiled code.", FileName, CodeIssue.HIGH, CodeLine)
-        ElseIf Regex.IsMatch(CodeLine, "\b(fwrite|file_get_contents|fopen|glob|popen|file|readfile)\b\s*\(\s*\$") Then
+        End If
+
+        '== Check for file read/write vulnerabilities ==
+        Dim fileReadWriteFunctions As String = "fwrite|file_get_contents|fopen|glob|popen|file_put_contents|fgets|fputs"
+
+        If Regex.IsMatch(CodeLine, "\b(" & fileReadWriteFunctions & ")\b\s*\(\s*\$") Then
             '== Check for use of user-defined variables ==
             For Each strVar In ctCodeTracker.InputVars
-                If Regex.IsMatch(CodeLine, "\b(fwrite|file_get_contents|fopen|glob|popen|file|readfile)\b\s*\(\s*" & strVar) Or Regex.IsMatch(CodeLine, "\b(fwrite|file_get_contents|fopen|glob|popen|file|readfile)\b\s*\(\s*\w+\s*\.\s*" & strVar) Then
-                    frmMain.ListCodeIssue("File Access Vulnerability", "The code appears to user-controlled variable as a parameter when accessing the filesystem. This could lead to a system compromise.", FileName, CodeIssue.HIGH, CodeLine)
+                If Regex.IsMatch(CodeLine, "\b(" & fileReadWriteFunctions & ")\b\s*\(\s*" & strVar) Or Regex.IsMatch(CodeLine, "\b(" & fileReadWriteFunctions & ")\b\s*\(\s*\w+\s*\.\s*" & strVar) Then
+                    frmMain.ListCodeIssue("File Access Vulnerability", "The code appears to use a user-controlled variable as a parameter when accessing the filesystem. This could lead to a system compromise.", FileName, CodeIssue.HIGH, CodeLine)
                     blnIsFound = True
                     Exit For
                 End If
@@ -217,9 +263,10 @@ Module modPHPCheck
         '=========================================================================
         Dim blnIsFound As Boolean = False
 
-
+        ' Skip if any validation functions are present
         If Regex.IsMatch(CodeLine, "validate|encode|sanitize|sanitise") Then Exit Sub
 
+        ' Check for unsafe function calls with consideration for false positives
         If Regex.IsMatch(CodeLine, "\b(exec|shell_exec|proc_open|eval|system|popen|passthru|pcntl_exec|assert)\b") And Not Regex.IsMatch(CodeLine, "escapeshellcmd") Then
             For Each strVar In ctCodeTracker.InputVars
                 If Regex.IsMatch(CodeLine, strVar) Then
@@ -233,6 +280,10 @@ Module modPHPCheck
             End If
         End If
 
+        ' Additional checks for specific functions that could cause RCE vulnerabilities
+        If Regex.IsMatch(CodeLine, "\b(SoapClient|Imagick)\b") Then
+            frmMain.ListCodeIssue("Potential RCE Vulnerability", "The application may use SoapClient() or Imagick() without proper validation, which could lead to Remote Code Execution vulnerabilities.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
     End Sub
 
     Private Sub CheckBackTick(CodeLine As String, FileName As String)
@@ -486,6 +537,30 @@ Module modPHPCheck
        CodeLine.Contains("empty(") Or
        CodeLine.Contains("filter_input(") Then
             ctCodeTracker.HasInputValidation = True
+        End If
+    End Sub
+
+    Private Sub CheckXXE(CodeLine As String, FileName As String)
+        ' Check for potential XXE vulnerabilities 
+        '=========================================
+
+        ' Only check unvalidated code
+        If ctCodeTracker.HasValidator = True Then Exit Sub
+
+        ' Check for the use of XML parsing functions
+        If Regex.IsMatch(CodeLine, "\b(simplexml_load_string|SimpleXMLElement|DOMDocument|xml_parse)\s*\(") Then
+            ' Check if external entities are disabled
+            If Not Regex.IsMatch(CodeLine, "libxml_disable_entity_loader\(\s*true\s*\)") AndAlso
+               Not Regex.IsMatch(CodeLine, "->loadXML\(\s*[^)]*\s*false\s*") AndAlso
+               Not Regex.IsMatch(CodeLine, "simplexml_load_string\(\s*[^,]*,\s*null\s*,\s*LIBXML_NOCDATA\s*\)") AndAlso
+               Not Regex.IsMatch(CodeLine, "new\s+SimpleXMLElement\s*\(\s*[^,]*,\s*null\s*,\s*LIBXML_NOCDATA\s*\)") Then
+                frmMain.ListCodeIssue("Potential XXE Vulnerability", "The application appears to parse XML input without disabling external entity loading, which could lead to XXE attacks.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+
+        ' Check for file_get_contents with XML
+        If Regex.IsMatch(CodeLine, "file_get_contents\s*\(\s*[^)]*\.xml\s*") Then
+            frmMain.ListCodeIssue("Potential XXE Vulnerability", "The application appears to load XML data from a file without proper validation, which may allow XXE attacks.", FileName, CodeIssue.HIGH, CodeLine)
         End If
     End Sub
 

@@ -54,6 +54,19 @@ Module modVBCheck
 
     End Sub
 
+    Public Enum Rules
+        MapControllerRoute   ' Identifies the use of MapControllerRoute, which is used to configure routes in ASP.NET MVC.
+        MapHttpRoute         ' Identifies the use of MapHttpRoute, which configures Web API routes. It might expose sensitive routes if misconfigured.
+        MapPageRoute         ' Detects usage of MapPageRoute, which configures routing for WebForms pages. Hardcoded routes might be a security concern.
+        MapRoute             ' Checks for MapRoute, used to define routing in MVC. Possible hardcoded routes should be reviewed.
+        CreateRoute          ' Detects the use of CreateRoute, which might create routes dynamically but can expose sensitive paths.
+        MapGet               ' Detects MapGet, used in minimal APIs to handle HTTP GET requests. Should check for any unsafe path configurations.
+        MapPost              ' Detects MapPost, used in minimal APIs to handle HTTP POST requests. Needs to ensure data validation on POST.
+        HttpGet              ' Detects HttpGet, which marks an action as responding to GET requests. Watch for information exposure via query strings.
+        HttpPost             ' Detects HttpPost, which marks an action as responding to POST requests. Ensure proper validation to avoid data leaks.
+        connectionString     ' Detects hardcoded connection strings. Hardcoded database connection strings should be replaced with secure alternatives like configuration files or environment variables.
+    End Enum
+
     Private Sub CheckRandomisation(CodeLine As String, FileName As String)
         ' Check for any random functions that are not cryptographically secure
         '=====================================================================
@@ -217,29 +230,64 @@ Module modVBCheck
     End Sub
 
     Public Sub CheckInsecureSerialization(CodeLine As String, FileName As String)
-        ' Regex để tìm các lớp serialization trong VB.NET
+        ' Check for insecure serialization and deserialization vulnerabilities
+        '=====================================================================
+
+        Dim strClassName As String = ""
+        Dim arrFragments As String()
+
+        ' Regex patterns for serialization and sanitization checks
         Dim serializerPattern As String = "\b(?:BinaryFormatter|SoapFormatter|XmlSerializer|DataContractSerializer|JavaScriptSerializer)\b"
+        Dim sanitizationPattern As String = "\b(?:SanitizeInput|Escape|HtmlEncode|UrlEncode|Clean|Validate)\s*\("
+        Dim gadgetPattern As String = "\b(?:System.Diagnostics.Process|System.Runtime.InteropServices.Marshal|System.IO.File|System.Security.Principal.WindowsIdentity|System.Web.UI.Page)\b"
 
-        ' Kiểm tra lớp serializer có xuất hiện trong mã không
-        If Regex.IsMatch(CodeLine, serializerPattern, RegexOptions.IgnoreCase) Then
-            ' Regex kiểm tra các phương thức xử lý đầu vào để xác định xem có kiểm tra hay làm sạch dữ liệu không
-            Dim sanitizationPattern As String = "\b(?:SanitizeInput|Escape|HtmlEncode|UrlEncode|Clean|Validate)\s*\("
+        ' Check for insecure deserialization
+        If Regex.IsMatch(CodeLine, "\.(Deserialize|ReadObject)\s*\(") Then
+            frmMain.ListCodeIssue("Unsafe Object Deserialization", "The code allows objects to be deserialized. This can allow potentially hostile objects to be instantiated directly from data held in the filesystem.", FileName, CodeIssue.STANDARD, CodeLine)
+        End If
 
-            If Not Regex.IsMatch(CodeLine, sanitizationPattern, RegexOptions.IgnoreCase) Then
-                frmMain.ListCodeIssue("Insecure Deserialization",
-                "The application may be deserializing untrusted input. Verify that input is validated before deserialization.",
-                FileName, CodeIssue.HIGH, CodeLine)
+        ' Check if serialization or deserialization classes are used
+        If Regex.IsMatch(CodeLine, serializerPattern) Then
+            ' Check for common sanitization methods
+            If Not Regex.IsMatch(CodeLine, sanitizationPattern) Then
+                frmMain.ListCodeIssue("Insecure Deserialization", "The application may be deserializing untrusted input. Verify that input is validated before deserialization.", FileName, CodeIssue.HIGH, CodeLine)
             End If
 
-            ' Kiểm tra sự hiện diện của các gadget có thể gây nguy hiểm
-            Dim gadgetPattern As String = "\b(?:System.Diagnostics.Process|System.Runtime.InteropServices.Marshal|System.IO.File|System.Security.Principal.WindowsIdentity|System.Web.UI.Page)\b"
-
-            If Regex.IsMatch(CodeLine, gadgetPattern, RegexOptions.IgnoreCase) Then
-                frmMain.ListCodeIssue("Insecure Deserialization - Gadget Detected",
-                "Potentially dangerous gadget found. Review code for exploitation risks associated with deserialization.",
-                FileName, CodeIssue.HIGH, CodeLine)
+            ' Check for known gadgets that could be used for exploitation
+            If Regex.IsMatch(CodeLine, gadgetPattern) Then
+                frmMain.ListCodeIssue("Insecure Deserialization - Gadget Detected", "Potentially dangerous gadget found. Review code for exploitation risks associated with deserialization.", FileName, CodeIssue.HIGH, CodeLine)
             End If
         End If
+
+        ' Check for TypeNameHandling usage in JsonConvert.DeserializeObject
+        If Regex.IsMatch(CodeLine, "JsonConvert\.DeserializeObject\s*\(.*,\s*new\s+JsonSerializerSettings\s*\(\)\s*{\s*TypeNameHandling\s*=\s*TypeNameHandling\.All\s*\}\s*\)") Then
+            frmMain.ListCodeIssue("Deserialization Risk", "TypeNameHandling is set to All, which may allow unsafe type resolution and deserialization attacks. Consider using None or Objects with strict type controls.", FileName, CodeIssue.CRITICAL, CodeLine)
+        ElseIf Regex.IsMatch(CodeLine, "JsonConvert\.DeserializeObject\s*\(.*,\s*new\s+JsonSerializerSettings\s*\(\)\s*{\s*TypeNameHandling\s*=\s*TypeNameHandling\.Objects\s*\}\s*\)") Then
+            frmMain.ListCodeIssue("Deserialization Risk", "TypeNameHandling is set to Objects, which may allow unsafe deserialization attacks. Ensure that untrusted input is not allowed.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        ' Check for serialization
+        If ctCodeTracker.IsSerializable = False And CodeLine.Contains("using System.Runtime.Serialization") Then
+            ' Serialization is implemented in the code module
+            ctCodeTracker.IsSerializable = True
+        ElseIf ctCodeTracker.IsSerializable = True And ctCodeTracker.IsSerializableClass = False And CodeLine.Contains("[Serializable") Then
+            ' Serialization is implemented for the class
+            ctCodeTracker.IsSerializableClass = True
+        ElseIf ctCodeTracker.IsSerializable = True And ctCodeTracker.IsSerializableClass = False And (CodeLine.Contains("[assembly: SecurityPermission(") Or CodeLine.Contains("[SecurityPermissionAttribute(")) Then
+            ' Serialization is safely implemented so discontinue the checks
+            ctCodeTracker.IsSerializable = False
+            ctCodeTracker.IsSerializableClass = False
+        ElseIf ctCodeTracker.IsSerializableClass = True And CodeLine.Contains("public class ") Then
+            ' Extract the vulnerable class name and write out results
+            ctCodeTracker.IsSerializableClass = False ' Reset after class name is found
+            arrFragments = CodeLine.Split("{")
+            arrFragments = arrFragments.First().Split(":")
+            strClassName = GetLastItem(arrFragments.First())
+            If Regex.IsMatch(strClassName, "^[a-zA-Z0-9_]*$") Then
+                frmMain.ListCodeIssue("Unsafe Object Serialization", "The code allows the object " & strClassName & " to be serialized. This can allow potentially sensitive data to be saved to the filesystem.", FileName, CodeIssue.STANDARD, CodeLine)
+            End If
+        End If
+
     End Sub
 
     Public Sub CheckOpenRedirect(CodeLine As String, FileName As String)
@@ -267,7 +315,7 @@ Module modVBCheck
         ' Check for file upload elements in VB.NET
         If CodeLine.Contains("Request.Files") Or CodeLine.Contains("HttpPostedFileBase") Or
         CodeLine.Contains("FileUpload") Or CodeLine.Contains("UploadFile") Or CodeLine.Contains("SaveAs") Or
-        CodeLine.Contains("IFormFile") Or CodeLine.Contains("Request.Form.Files") Or
+        CodeLine.Contains("IFormFile") Or CodeLine.Contains("Request.Form.Files") Or CodeLine.Contains("(MapPath") Or
         CodeLine.Contains("PostedFile.SaveAs") Then
             isUploadFunctionPresent = True
         End If
@@ -343,6 +391,52 @@ Module modVBCheck
             End If
         End If
 
+    End Sub
+
+    Private Sub CheckMisconfiguredRoutes(CodeLine As String, FileName As String)
+        ' Check for potential misconfigurations in routes and HTTP methods defined in enum.Rules
+        '=======================================================================================
+
+        ' Create a dictionary with the rules and corresponding warning messages
+        Dim rulesDictionary As New Dictionary(Of Rules, String) From {
+        {Rules.MapControllerRoute, "Possible misconfigured route: MapControllerRoute"},
+        {Rules.MapHttpRoute, "Possible misconfigured route: MapHttpRoute"},
+        {Rules.MapPageRoute, "Possible misconfigured route: MapPageRoute"},
+        {Rules.MapRoute, "Possible misconfigured route: MapRoute"},
+        {Rules.CreateRoute, "Possible misconfigured route: CreateRoute"},
+        {Rules.MapGet, "Potential issue with hardcoded HTTP GET: MapGet"},
+        {Rules.MapPost, "Potential issue with hardcoded HTTP POST: MapPost"},
+        {Rules.HttpGet, "Use of HTTP GET detected, check if it’s secure"},
+        {Rules.HttpPost, "Use of HTTP POST detected, validate data properly"},
+        {Rules.connectionString, "Potential hardcoded connection string detected"}
+    }
+
+        ' Loop through each rule and check the CodeLine for violations
+        For Each rule In rulesDictionary.Keys
+            Dim pattern As String = ""
+
+            ' Generate the regular expression pattern based on the rule
+            Select Case rule
+                Case Rules.MapControllerRoute, Rules.MapHttpRoute, Rules.MapPageRoute, Rules.MapRoute, Rules.CreateRoute
+                    ' Match route mapping functions
+                    pattern = "\b" & Regex.Escape(rule.ToString()) & "\("
+                Case Rules.MapGet, Rules.MapPost, Rules.HttpGet, Rules.HttpPost
+                    ' Match HTTP verbs
+                    pattern = "\b" & Regex.Escape(rule.ToString()) & "\("
+                Case Rules.connectionString
+                    ' Match potential hardcoded connection string
+                    pattern = "connectionString=\"""
+            End Select
+
+            ' Ensure the pattern is not empty
+            If Not String.IsNullOrEmpty(pattern) Then
+                ' Check if the current line matches the regular expression pattern
+                If Regex.IsMatch(CodeLine, pattern) Then
+                    ' Log the issue found in the code with severity level
+                    frmMain.ListCodeIssue("Misconfiguration Detected", rulesDictionary(rule), FileName, CodeIssue.MEDIUM, CodeLine)
+                End If
+            End If
+        Next
     End Sub
 
 
