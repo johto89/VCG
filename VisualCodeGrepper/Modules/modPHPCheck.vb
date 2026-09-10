@@ -41,6 +41,19 @@ Module modPHPCheck
         CheckXXE(CodeLine, FileName)                        ' Check for potential XXE vulnerabilities 
         CheckStreamFilters(CodeLine, FileName)              ' Check for unsafe usage of stream filters like zlib.inflate and dechunk
 
+        '== Extended ruleset ==
+        CheckPHPWeakCrypto(CodeLine, FileName)              ' Broken hashes, mcrypt/ECB, timing-unsafe comparison, weak PRNG
+        CheckPHPTypeJuggling(CodeLine, FileName)            ' Magic hashes, in_array/strcmp and switch coercion issues
+        CheckPHPSSRF(CodeLine, FileName)                    ' User-controlled outbound requests and disabled TLS verification
+        CheckPHPFileHandling(CodeLine, FileName)            ' Path traversal, upload metadata trust, Zip Slip and phar://
+        CheckPHPHeaderInjection(CodeLine, FileName)         ' Response splitting, open redirect and mail header injection
+        CheckPHPSessionSecurity(CodeLine, FileName)         ' Session fixation and insecure session/cookie configuration
+        CheckPHPCodeInjection(CodeLine, FileName)           ' assert/create_function, dynamic callbacks, extract, /e modifier
+        CheckPHPCommandArguments(CodeLine, FileName)        ' Incomplete shell escaping and argument injection
+        CheckPHPFrameworkIssues(CodeLine, FileName)         ' Raw query builders, unescaped templates, debug mode, mass assignment
+        CheckPHPHardcodedSecrets(CodeLine, FileName)        ' API keys, private keys and credentials embedded in source
+        CheckPHPCorsAndHeaders(CodeLine, FileName)          ' Permissive or reflected CORS configuration
+
         '== Check for passwords being handled in a case-insensitive manner ==
         If Regex.IsMatch(CodeLine, "(strtolower|strtoupper)\s*\(\s*\S*(Password|password|pwd|PWD|Pwd|Passwd|passwd)") Then
             frmMain.ListCodeIssue("Unsafe Password Management", "The application appears to handle passwords in a case-insensitive manner. This can greatly increase the likelihood of successful brute-force and/or dictionary attacks.", FileName, CodeIssue.MEDIUM, CodeLine)
@@ -145,9 +158,9 @@ Module modPHPCheck
             strVarName = GetVarName(CodeLine)
             If Regex.IsMatch(strVarName, "^\\\$[a-zA-Z0-9_]*$") And Not ctCodeTracker.InputVars.Contains(strVarName) Then ctCodeTracker.InputVars.Add(strVarName)
         ElseIf Regex.IsMatch(CodeLine, "\b(print|echo|print_r)\b") And CodeLine.Contains("$") And Not Regex.IsMatch(CodeLine, "strip_tags") Then
-        CheckUserVarXSS(CodeLine, FileName)
+            CheckUserVarXSS(CodeLine, FileName)
         ElseIf Regex.IsMatch(CodeLine, "\b(print|echo|print_r)\b\s*\$_(GET|POST|COOKIE|REQUEST|SERVER)") And Not Regex.IsMatch(CodeLine, "strip_tags") Then
-        frmMain.ListCodeIssue("Potential XSS", "The application appears to reflect a user-supplied variable to the screen with no apparent validation or sanitisation.", FileName, CodeIssue.HIGH, CodeLine)
+            frmMain.ListCodeIssue("Potential XSS", "The application appears to reflect a user-supplied variable to the screen with no apparent validation or sanitisation.", FileName, CodeIssue.HIGH, CodeLine)
         End If
 
         '== Check for DOM-based XSS in .php pages ==
@@ -565,4 +578,286 @@ Module modPHPCheck
     End Sub
 
 
+
+    '======================================================================================
+    '== EXTENDED RULESET                                                                 ==
+    '== Additional checks appended without altering any pre-existing logic.              ==
+    '======================================================================================
+
+    Private Function IsUserInputPHP(CodeLine As String) As Boolean
+        ' Return True where the line appears to reference a tainted (user-controlled) source
+        '==================================================================================
+
+        If Regex.IsMatch(CodeLine, "\$_(GET|POST|REQUEST|COOKIE|FILES|SERVER|ENV)\b") Then Return True
+        If Regex.IsMatch(CodeLine, "\b(file_get_contents\s*\(\s*['""]php://input|getallheaders|apache_request_headers|filter_input)\b") Then Return True
+        If Regex.IsMatch(CodeLine, "->\s*(input|query|get|post|all|request)\s*\(") Then Return True
+        If Regex.IsMatch(CodeLine, "\bRequest::\s*(input|query|get|all|post)\b") Then Return True
+
+        For Each strVar In ctCodeTracker.InputVars
+            If strVar <> "" AndAlso CodeLine.Contains(strVar) Then Return True
+        Next
+
+        Return False
+
+    End Function
+
+    Private Sub CheckPHPWeakCrypto(CodeLine As String, FileName As String)
+        ' Identify broken hashing, obsolete ciphers and weak password storage
+        '====================================================================
+
+        '== Broken hash algorithms ==
+        If Regex.IsMatch(CodeLine, "\b(md5|sha1|crc32|crc32b)\s*\(") Or Regex.IsMatch(CodeLine, "\bhash\s*\(\s*['""]\s*(md2|md4|md5|sha1|crc32b?)\s*['""]") Then
+            If Regex.IsMatch(CodeLine, "(?i)\$?\w*(password|passwd|pwd|secret|token|salt|auth)\w*") Then
+                frmMain.ListCodeIssue("Password or Token Hashed With A Broken Algorithm", "MD5 and SHA-1 are fast, unsalted and collision-prone. A commodity GPU tests tens of billions of MD5 candidates per second, so any password database hashed this way should be regarded as cleartext. Use password_hash() with PASSWORD_ARGON2ID or PASSWORD_BCRYPT and verify with password_verify().", FileName, CodeIssue.HIGH, CodeLine)
+            Else
+                frmMain.ListCodeIssue("Use of Broken Hashing Algorithm", "MD5, SHA-1 and CRC32 are unsuitable for any security purpose. Practical collisions exist for MD5 and SHA-1, and CRC32 is a checksum with no cryptographic properties at all.", FileName, CodeIssue.MEDIUM, CodeLine)
+            End If
+        End If
+
+        '== Obsolete crypto extensions and ciphers ==
+        If Regex.IsMatch(CodeLine, "\bmcrypt_\w+\s*\(") Then
+            frmMain.ListCodeIssue("Use of Removed mcrypt Extension", "mcrypt was deprecated in PHP 7.1 and removed in 7.2. It defaults to zero-padding, has no authenticated modes and its 'rijndael-256' is not AES-256. Use OpenSSL with aes-256-gcm or libsodium.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "openssl_(encrypt|decrypt)\s*\([^\)]*['""]\s*(des|des-ede3|rc2|rc4|bf|aes-\d+-ecb|[a-z0-9\-]*ecb)\s*['""]") Then
+            frmMain.ListCodeIssue("Broken Cipher Or ECB Mode Selected", "DES, RC2, RC4, Blowfish and any ECB mode are unsuitable. ECB in particular leaks plaintext structure because identical blocks map to identical ciphertext. Use aes-256-gcm, which additionally provides integrity.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "openssl_(encrypt|decrypt)\s*\(") And Not Regex.IsMatch(CodeLine, "(gcm|ccm|poly1305|chacha)") Then
+            frmMain.ListCodeIssue("Unauthenticated Encryption", "The cipher suite provides confidentiality without integrity. An attacker who can modify ciphertext may be able to alter the decrypted plaintext undetected, and CBC padding errors frequently expose a padding oracle. Use an AEAD mode or apply Encrypt-then-MAC with hash_hmac and a separate key.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        '== Predictable IV or key ==
+        If Regex.IsMatch(CodeLine, "openssl_(encrypt|decrypt)\s*\([^\)]*['""][A-Za-z0-9\+/=]{8,}['""]") Then
+            frmMain.ListCodeIssue("Hard-Coded Key Or IV", "Key or IV material appears as a literal in the call. Recovery of the source or the deployed file yields the key, so the encryption provides no confidentiality. Generate IVs with random_bytes() per message and load keys from the environment or a secrets manager.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        '== Non-constant-time comparison of secrets ==
+        If Regex.IsMatch(CodeLine, "(?i)(if|while|return|elseif)\s*\(?[^;]*\$?\w*(password|token|hash|hmac|signature|secret|apikey)\w*[^;]*(===|==|!=|!==)") And Not CodeLine.Contains("hash_equals") Then
+            frmMain.ListCodeIssue("Non Constant-Time Comparison Of A Secret", "Comparing a token, signature or hash with == or === exits at the first differing byte. The resulting timing difference allows an attacker to recover the expected value one byte at a time over many requests. Use hash_equals().", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        '== Predictable randomness ==
+        If Regex.IsMatch(CodeLine, "\b(rand|mt_rand|uniqid|shuffle|str_shuffle|array_rand|lcg_value)\s*\(") And _
+           Regex.IsMatch(CodeLine, "(?i)\$?\w*(token|session|nonce|salt|key|password|otp|secret|csrf|reset|id)\w*") Then
+            frmMain.ListCodeIssue("Predictable Random Value Used For Security Purpose", "rand(), mt_rand() and uniqid() are not cryptographically secure. mt_rand uses Mersenne Twister, whose entire internal state is recoverable from 624 consecutive outputs; uniqid is derived from the system clock and is trivially predictable. Use random_bytes() or random_int().", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckPHPTypeJuggling(CodeLine As String, FileName As String)
+        ' Identify loose comparison issues affecting authentication logic
+        '================================================================
+
+        If Regex.IsMatch(CodeLine, "(md5|sha1|hash|crypt)\s*\([^\)]*\)\s*==[^=]") Or Regex.IsMatch(CodeLine, "==\s*(md5|sha1|hash)\s*\(") Then
+            frmMain.ListCodeIssue("Loose Comparison Of Hash Values (Type Juggling)", "PHP's == operator applies type coercion. Two hashes that both begin '0e' followed only by digits are treated as floating-point zero and compare equal - the 'magic hash' attack, which permits authentication bypass. Always compare hashes with === or hash_equals().", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\bin_array\s*\(") And Not Regex.IsMatch(CodeLine, ",\s*true\s*\)") Then
+            frmMain.ListCodeIssue("in_array() Without Strict Comparison", "Without the third argument set to true, in_array performs loose comparison. The string '1abc' matches the integer 1, and the value 0 matches any non-numeric string in older PHP versions, allowing allow-list checks to be bypassed.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\bstrcmp\s*\([^\)]*\)\s*==\s*0") Or Regex.IsMatch(CodeLine, "\b(strcmp|strcasecmp)\s*\(") And IsUserInputPHP(CodeLine) Then
+            frmMain.ListCodeIssue("strcmp() Result Used In Loose Comparison", "Passing an array where strcmp expects a string returns NULL, and NULL == 0 evaluates to true. Supplying param[]= in the query string therefore satisfies a strcmp-based password check. Validate the parameter type before comparison and use ===.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\bswitch\s*\(") And IsUserInputPHP(CodeLine) Then
+            frmMain.ListCodeIssue("Switch Statement On User Input", "PHP's switch uses loose comparison, so a numeric string or a leading-numeric string may match an unintended case label. Where the switch implements an authorisation decision this can be abused. Normalise and validate the value first.", FileName, CodeIssue.LOW, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckPHPSSRF(CodeLine As String, FileName As String)
+        ' Identify outbound requests whose destination is user-controlled
+        '================================================================
+
+        If Regex.IsMatch(CodeLine, "\b(curl_setopt|curl_init|file_get_contents|fopen|readfile|get_headers|fsockopen|stream_context_create|simplexml_load_file|DOMDocument)\b") Then
+            If IsUserInputPHP(CodeLine) Then
+                frmMain.ListCodeIssue("Potential Server-Side Request Forgery (SSRF)", "The destination of an outbound request is derived from user input. PHP stream wrappers make this especially dangerous: as well as reaching internal services and cloud metadata endpoints, the file://, php:// and gopher:// wrappers permit local file disclosure and crafted requests to arbitrary TCP services. Validate the scheme and host against an allow-list and reject private address ranges after resolution.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+
+        If Regex.IsMatch(CodeLine, "CURLOPT_SSL_VERIFY(PEER|HOST)\s*,\s*(0|false|FALSE)") Then
+            frmMain.ListCodeIssue("cURL TLS Verification Disabled", "Certificate or hostname verification has been switched off, so any certificate is accepted and the connection offers no protection against active interception. Note that CURLOPT_SSL_VERIFYHOST must be set to 2, not 1 - the value 1 is meaningless and is treated as an error in current libcurl.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "CURLOPT_FOLLOWLOCATION\s*,\s*(1|true|TRUE)") Then
+            frmMain.ListCodeIssue("cURL Redirect Following Enabled", "Following redirects automatically allows an allow-listed host to redirect the request to an internal address, bypassing SSRF filtering. Disable it and validate each hop, or set CURLOPT_PROTOCOLS and CURLOPT_REDIR_PROTOCOLS to restrict schemes.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckPHPFileHandling(CodeLine As String, FileName As String)
+        ' Identify path traversal, unrestricted upload and archive extraction issues
+        '===========================================================================
+
+        If Regex.IsMatch(CodeLine, "\b(fopen|file_get_contents|file_put_contents|readfile|unlink|rename|copy|mkdir|rmdir|scandir|glob|opendir|file|highlight_file|show_source)\s*\(") And IsUserInputPHP(CodeLine) Then
+            frmMain.ListCodeIssue("Potential Path Traversal Or Local File Disclosure", "A filesystem path is built from request data. Traversal sequences allow arbitrary file read or write; note that PHP also resolves stream wrappers here, so an input beginning 'php://filter/convert.base64-encode/resource=' returns the source of any readable file. Use basename() plus realpath() and confirm the resolved path remains under the intended directory.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\bmove_uploaded_file\s*\(") Then
+            frmMain.ListCodeIssue("File Upload Handling", "An uploaded file is written to disk. Confirm that the destination filename is generated server-side rather than taken from $_FILES['name'], that the extension is validated against an allow-list, that the storage directory is outside the web root or has script execution disabled, and that the MIME type reported by the client is not trusted.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\$_FILES\s*\[[^\]]*\]\s*\[\s*['""](name|type)['""]\s*\]") Then
+            frmMain.ListCodeIssue("Reliance On Client-Supplied Upload Metadata", "The filename and MIME type in $_FILES are supplied by the client and are trivially forged. Determine the type server-side with finfo_file and generate the stored filename yourself.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\b(ZipArchive|PharData|extractTo)\b") Then
+            frmMain.ListCodeIssue("Potential Zip Slip During Archive Extraction", "extractTo() writes entries using the names stored in the archive. Traversal sequences in an entry name allow files to be written outside the destination directory. Enumerate entries and validate each resolved path before extraction.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "['""]phar://") Then
+            frmMain.ListCodeIssue("Phar Stream Wrapper In Use", "Any filesystem function operating on a phar:// path deserialises the archive metadata, invoking __wakeup and __destruct on arbitrary classes. This turns an apparently harmless file operation into an object injection sink. Register a phar stream wrapper guard or disable phar in production.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckPHPHeaderInjection(CodeLine As String, FileName As String)
+        ' Identify response splitting, open redirect and mail header injection
+        '=====================================================================
+
+        If Regex.IsMatch(CodeLine, "\bheader\s*\(") And IsUserInputPHP(CodeLine) Then
+            If Regex.IsMatch(CodeLine, "(?i)header\s*\(\s*['""]\s*location") Then
+                frmMain.ListCodeIssue("Potential Open Redirect", "The redirect target is built from user input. An attacker can send victims to a site under their control while the initial link points at the trusted domain, which is highly effective in phishing and is also used to steal OAuth authorisation codes. Redirect only to relative paths, or match the target against an allow-list.", FileName, CodeIssue.MEDIUM, CodeLine)
+            Else
+                frmMain.ListCodeIssue("Potential HTTP Response Header Injection", "A header value contains user input. Where carriage return and line feed are not stripped an attacker injects further headers or a complete second response, enabling cache poisoning and reflected cross-site scripting. Modern PHP blocks bare newlines in header(), but encoded variants and framework wrappers are not always protected.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+
+        If Regex.IsMatch(CodeLine, "\bmail\s*\(") And IsUserInputPHP(CodeLine) Then
+            frmMain.ListCodeIssue("Potential Mail Header Or Argument Injection", "User input reaches mail(). Newlines in the subject or additional-headers parameter allow injection of Bcc and Cc headers, turning the application into an open relay for spam. The fifth parameter is passed to sendmail as command-line arguments, so unvalidated input there permits arbitrary file write via the -X option.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckPHPSessionSecurity(CodeLine As String, FileName As String)
+        ' Identify session fixation and insecure session configuration
+        '=============================================================
+
+        If Regex.IsMatch(CodeLine, "\bsession_id\s*\(\s*\$") Then
+            frmMain.ListCodeIssue("Session Identifier Set From A Variable", "The session identifier is assigned from a variable. Where that value originates from the request an attacker can fix a known session identifier in the victim's browser and then reuse it after the victim authenticates - classic session fixation.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "session\.use_(only_)?cookies\s*['""]?\s*,\s*['""]?\s*0") Or Regex.IsMatch(CodeLine, "session\.use_trans_sid\s*['""]?\s*,\s*['""]?\s*1") Then
+            frmMain.ListCodeIssue("Session Identifier Permitted In The URL", "Transparent session identifiers place the token in URLs, where it leaks through Referer headers, browser history, proxy logs and shared links.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "session\.cookie_(httponly|secure)\s*['""]?\s*,\s*['""]?\s*(0|false|off)") Or _
+           Regex.IsMatch(CodeLine, "setcookie\s*\([^\)]*,\s*(false|0)\s*,\s*(false|0)\s*\)") Then
+            frmMain.ListCodeIssue("Session Cookie Missing Secure Or HttpOnly Flag", "Without HttpOnly the session cookie is readable by JavaScript, so any cross-site scripting flaw becomes session theft; without Secure it is transmitted over plain HTTP and can be captured on the network.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\bsession_start\s*\(") And Not Regex.IsMatch(CodeLine, "session_regenerate_id") Then
+            frmMain.ListCodeIssue("Session Started - Confirm Identifier Regeneration", "Confirm that session_regenerate_id(true) is called immediately after any privilege change, in particular after successful authentication. Failure to regenerate leaves the application open to session fixation.", FileName, CodeIssue.LOW, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckPHPCodeInjection(CodeLine As String, FileName As String)
+        ' Identify additional dynamic evaluation and callback sinks
+        '==========================================================
+
+        If Regex.IsMatch(CodeLine, "\b(assert|create_function)\s*\(") Then
+            frmMain.ListCodeIssue("Use of assert() Or create_function()", "Both functions evaluate their string argument as PHP code. assert() with a string argument is deprecated in PHP 7.2 and removed in 8; create_function() was removed in PHP 8. Where any part of the argument is user-controlled this is direct remote code execution.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\b(call_user_func|call_user_func_array|array_map|usort|uasort|uksort|array_filter|array_walk|register_shutdown_function|set_error_handler|preg_replace_callback)\s*\(") And IsUserInputPHP(CodeLine) Then
+            frmMain.ListCodeIssue("User Controlled Callback Function", "The callable passed to this function appears to derive from user input. PHP will invoke any named function, including system, exec and assert, giving arbitrary code execution. Map the input to a fixed set of permitted callbacks.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "preg_replace\s*\(\s*['""][^'""]*['""][eimsuxADSUXJ]*e[imsuxADSUXJ]*['""]") Then
+            frmMain.ListCodeIssue("preg_replace() With The /e Modifier", "The /e modifier evaluates the replacement string as PHP code. It was removed in PHP 7 but remains a reliable code execution sink in legacy deployments.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\$\s*\$\w+|\$\{\s*\$") Then
+            frmMain.ListCodeIssue("Variable Variable In Use", "Variable variables resolve a name at runtime. Where the name derives from request data an attacker can overwrite arbitrary variables in scope, including those holding authentication state or configuration.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\b(extract|import_request_variables|compact)\s*\(") Then
+            frmMain.ListCodeIssue("Variable Extraction From An Array", "extract() creates variables from array keys. Applied to request data it lets an attacker overwrite any variable in the current scope - a well-known authentication bypass technique. Use explicit assignment with EXTR_SKIP at minimum.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckPHPCommandArguments(CodeLine As String, FileName As String)
+        ' Identify incomplete escaping around shell invocation
+        '=====================================================
+
+        If Regex.IsMatch(CodeLine, "\b(system|exec|shell_exec|passthru|popen|proc_open|pcntl_exec)\s*\(") Then
+            If Regex.IsMatch(CodeLine, "\bescapeshellcmd\s*\(") And Not Regex.IsMatch(CodeLine, "\bescapeshellarg\s*\(") Then
+                frmMain.ListCodeIssue("escapeshellcmd() Used Where escapeshellarg() Is Required", "escapeshellcmd escapes shell metacharacters but leaves whitespace and quotes intact, so an attacker can still introduce additional arguments to the invoked program - for example adding an output-file or configuration switch. Wrap each individual argument in escapeshellarg().", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+            If Regex.IsMatch(CodeLine, "escapeshellarg\s*\([^\)]*\)\s*\.") And Regex.IsMatch(CodeLine, "['""]\s*-") Then
+                frmMain.ListCodeIssue("Argument Injection Despite Escaping", "escapeshellarg prevents command chaining but not argument injection: a value beginning with '-' is still interpreted as an option by the target program. Where the argument is a filename, prefix it with './' or terminate option parsing with '--'.", FileName, CodeIssue.MEDIUM, CodeLine)
+            End If
+        End If
+
+    End Sub
+
+    Private Sub CheckPHPFrameworkIssues(CodeLine As String, FileName As String)
+        ' Identify framework-specific insecure constructs
+        '================================================
+
+        '== Raw query builders ==
+        If Regex.IsMatch(CodeLine, "\b(DB::raw|whereRaw|orWhereRaw|havingRaw|orderByRaw|selectRaw|groupByRaw|->raw\s*\()") And CodeLine.Contains("$") Then
+            frmMain.ListCodeIssue("Raw SQL Fragment With Interpolated Variable", "Raw query-builder helpers pass the string straight to the database. Interpolating a variable into the fragment reintroduces SQL injection despite the ORM. Use bound parameters via the second argument.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        '== Unescaped template output ==
+        If Regex.IsMatch(CodeLine, "\{!!.*!!\}") Or Regex.IsMatch(CodeLine, "\|\s*raw\b") Then
+            frmMain.ListCodeIssue("Unescaped Template Output", "Blade's {!! !!} and Twig's |raw filter emit the value without HTML encoding. Where the value contains user input this is a direct cross-site scripting sink.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        '== Debug and environment exposure ==
+        If Regex.IsMatch(CodeLine, "(APP_DEBUG|display_errors)\s*[=:]\s*['""]?\s*(true|on|1)") Then
+            frmMain.ListCodeIssue("Debug Mode Enabled", "Debug output exposes stack traces, environment variables and often database credentials to any client that triggers an error. In Laravel the Ignition debug page has additionally been the vehicle for remote code execution (CVE-2021-3129).", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        '== Mass assignment ==
+        If Regex.IsMatch(CodeLine, "\$guarded\s*=\s*\[\s*\]") Or Regex.IsMatch(CodeLine, "\bunguard\s*\(|forceFill\s*\(") Then
+            frmMain.ListCodeIssue("Eloquent Mass Assignment Protection Disabled", "An empty $guarded array, unguard() or forceFill() allows every attribute to be set from request input. An attacker adds fields such as is_admin or user_id to the request body and escalates privilege. Define an explicit $fillable allow-list.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        '== Object injection through unserialize on cookies ==
+        If Regex.IsMatch(CodeLine, "\bunserialize\s*\(") And IsUserInputPHP(CodeLine) Then
+            frmMain.ListCodeIssue("unserialize() On User-Controlled Data", "unserialize reconstructs arbitrary objects and invokes their magic methods (__wakeup, __destruct, __toString). Combined with the classes available in the application or its dependencies this yields PHP object injection and frequently remote code execution. Use json_decode, or pass the allowed_classes option set to false.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckPHPHardcodedSecrets(CodeLine As String, FileName As String)
+        ' Identify credentials and API keys embedded in source
+        '=====================================================
+
+        If Regex.IsMatch(CodeLine, "AKIA[0-9A-Z]{16}") Then
+            frmMain.ListCodeIssue("Hard-Coded AWS Access Key", "A string matching the AWS access key ID format is present in source. Revoke the key and move to an instance role or secrets manager.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "(gh[pousr]_[A-Za-z0-9]{36}|xox[baprs]-[A-Za-z0-9\-]{10,}|sk_live_[0-9a-zA-Z]{24,}|AIza[0-9A-Za-z\-_]{35})") Then
+            frmMain.ListCodeIssue("Hard-Coded Third-Party API Token", "A GitHub, Slack, Stripe or Google API token appears to be embedded in source.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "-----BEGIN\s+(RSA|EC|DSA|OPENSSH|PGP)?\s*PRIVATE KEY") Then
+            frmMain.ListCodeIssue("Private Key Embedded In Source", "A PEM-encoded private key is stored in the repository and must be treated as compromised.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "(?i)(\$\w*(password|passwd|pwd|secret|apikey|api_key|token|salt)\w*|'(password|secret|key|token)')\s*(=|=>)\s*['""][^'""]{4,}['""]") Then
+            frmMain.ListCodeIssue("Hard-Coded Secret Assigned To Variable", "A variable or configuration key whose name indicates a credential is initialised with a literal string. Move it to an environment variable or secrets manager and rotate the value, since it persists in version control history.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(mysqli_connect|new\s+mysqli|new\s+PDO|pg_connect)\s*\([^\)]*['""][^'""]{3,}['""]\s*\)") Then
+            frmMain.ListCodeIssue("Database Credentials In Connection Call", "Connection credentials appear inline in the source. Where the file is served as plain text because of a misconfiguration or a backup extension, the credentials are disclosed directly.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckPHPCorsAndHeaders(CodeLine As String, FileName As String)
+        ' Identify permissive CORS and missing security headers
+        '======================================================
+
+        If Regex.IsMatch(CodeLine, "Access-Control-Allow-Origin\s*:\s*\*") Then
+            frmMain.ListCodeIssue("Overly Permissive CORS Policy", "Any origin may read responses from this endpoint. Where the endpoint returns user-specific data this exposes it to every site the victim visits.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "Access-Control-Allow-Origin\s*:\s*[""']?\s*\.?\s*\$") Then
+            frmMain.ListCodeIssue("CORS Origin Reflected From The Request", "The Origin header is echoed back without validation. Combined with Access-Control-Allow-Credentials this allows any website to make authenticated cross-origin requests and read the responses.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "Access-Control-Allow-Credentials\s*:\s*true") And Regex.IsMatch(CodeLine, "Access-Control-Allow-Origin\s*:\s*(\*|[""']?\s*\.?\s*\$)") Then
+            frmMain.ListCodeIssue("CORS Credentials Permitted With Wildcard Or Reflected Origin", "This combination allows arbitrary sites to issue authenticated cross-origin requests with the victim's cookies and read the responses.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+    End Sub
 End Module

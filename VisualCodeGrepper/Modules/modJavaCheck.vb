@@ -50,6 +50,21 @@ Module modJavaCheck
         CheckResourceRelease(CodeLine, FileName)            ' Are file resources safely handled in try ... catch blocks
         CheckInsecureDeserialization(CodeLine, FileName)    ' Check for insecure deserialization vulnerabilities
 
+        '== Extended ruleset ==
+        CheckJavaWeakCrypto(CodeLine, FileName)             ' Broken hashes/ciphers, ECB, hard-coded keys, weak randomness
+        CheckJavaTrustManager(CodeLine, FileName)           ' Permissive TrustManager/HostnameVerifier and obsolete TLS
+        CheckJavaPathTraversal(CodeLine, FileName)          ' User-controlled filesystem paths and Zip Slip
+        CheckJavaSSRF(CodeLine, FileName)                   ' User-controlled outbound request destinations
+        CheckJavaExpressionInjection(CodeLine, FileName)    ' SpEL/OGNL/MVEL, scripting engines and template injection
+        CheckJavaJndiInjection(CodeLine, FileName)          ' JNDI lookups and Log4Shell indicators
+        CheckJavaLdapXPath(CodeLine, FileName)              ' LDAP and XPath queries built by concatenation
+        CheckSpringSecurityConfig(CodeLine, FileName)       ' CSRF disabled, permitAll, CORS, password encoders, actuators
+        CheckJavaJwt(CodeLine, FileName)                    ' Unsigned tokens, 'none' algorithm, hard-coded signing secrets
+        CheckJavaDeserializationExtended(CodeLine, FileName) ' XStream, Jackson default typing, SnakeYAML, BeanUtils
+        CheckJavaHardcodedSecrets(CodeLine, FileName)       ' API keys, private keys and credentials embedded in source
+        CheckJavaLogging(CodeLine, FileName)                ' Sensitive data and unsanitised input written to logs
+        CheckAndroidComponentSecurity(CodeLine, FileName)   ' WebView, storage, exported components and PendingIntent flags
+
         ' Identify any nested classes (if required by user)
         If asAppSettings.IsInnerClassCheck Then CheckInnerClasses(CodeLine, FileName)
 
@@ -912,4 +927,342 @@ Module modJavaCheck
     End Sub
 
 
+
+    '======================================================================================
+    '== EXTENDED RULESET                                                                 ==
+    '== Additional checks appended without altering any pre-existing logic.              ==
+    '======================================================================================
+
+    Private Function IsUserInputJava(CodeLine As String) As Boolean
+        ' Return True where the line appears to reference a tainted (user-controlled) source
+        '==================================================================================
+
+        If Regex.IsMatch(CodeLine, "\b(getParameter|getParameterValues|getParameterMap|getHeader|getHeaders|getCookies|getQueryString|getInputStream|getReader|getPathInfo|getRequestURI|getRequestURL|getRemoteUser|getPart|getParts)\s*\(") Then Return True
+        If Regex.IsMatch(CodeLine, "@(RequestParam|PathVariable|RequestBody|RequestHeader|CookieValue|ModelAttribute|MatrixVariable|QueryParam|FormParam|HeaderParam|PathParam)\b") Then Return True
+        If Regex.IsMatch(CodeLine, "\b(System\s*\.\s*getenv|System\s*\.\s*getProperty|Scanner\s*\(\s*System\s*\.\s*in|BufferedReader)\b") Then Return True
+        If Regex.IsMatch(CodeLine, "\b(getIntent\s*\(\s*\)|getStringExtra|getExtras|getQueryParameter|getData\s*\(\s*\))\b") Then Return True
+        If Regex.IsMatch(CodeLine, "\bargs\s*\[") Then Return True
+
+        Return False
+
+    End Function
+
+    Private Sub CheckJavaWeakCrypto(CodeLine As String, FileName As String)
+        ' Identify broken cryptographic primitives, modes and key material
+        '=================================================================
+        Dim mchMatch As Match
+        Dim intKeySize As Integer = 0
+
+
+        '== Broken hash algorithms ==
+        If Regex.IsMatch(CodeLine, "MessageDigest\s*\.\s*getInstance\s*\(\s*""\s*(MD2|MD4|MD5|SHA-?1)\s*""") Or _
+           Regex.IsMatch(CodeLine, "\b(DigestUtils\s*\.\s*(md5|md5Hex|sha1|sha1Hex)|Hashing\s*\.\s*(md5|sha1))\s*\(") Or _
+           Regex.IsMatch(CodeLine, "Mac\s*\.\s*getInstance\s*\(\s*""\s*Hmac(MD5|SHA1)\s*""") Then
+            frmMain.ListCodeIssue("Use of Broken or Deprecated Hashing Algorithm", "The code selects MD2, MD4, MD5 or SHA-1. Practical collision attacks exist against all of these, so they cannot be relied upon for signatures, integrity verification or password storage. Move to SHA-256 or better; for passwords use Argon2id, bcrypt or PBKDF2-HMAC-SHA256 with a high iteration count.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        '== Broken ciphers and unsafe modes ==
+        If Regex.IsMatch(CodeLine, "Cipher\s*\.\s*getInstance\s*\(\s*""\s*(DES|DESede|TripleDES|RC2|RC4|ARCFOUR|Blowfish)\b") Then
+            frmMain.ListCodeIssue("Use of Broken or Deprecated Symmetric Cipher", "DES, Triple-DES, RC2, RC4 and Blowfish are all unsuitable for new work: DES has a 56-bit key, RC4 has statistical biases that leak plaintext, and the 64-bit block sizes of DESede and Blowfish expose them to Sweet32 birthday attacks. Use AES-256-GCM.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "Cipher\s*\.\s*getInstance\s*\(\s*""[^""]*ECB") Then
+            frmMain.ListCodeIssue("Use of ECB Cipher Mode", "ECB encrypts each block independently, so identical plaintext blocks yield identical ciphertext blocks. Structure of the plaintext leaks directly and blocks can be reordered or spliced by an attacker. Use AES/GCM/NoPadding.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "Cipher\s*\.\s*getInstance\s*\(\s*""\s*(AES|DES|DESede|Blowfish)\s*""\s*\)") Then
+            frmMain.ListCodeIssue("Cipher Transformation Without Explicit Mode", "Requesting a bare algorithm name causes the JCE to fall back to the provider default, which for SunJCE is ECB. Always specify the mode and padding explicitly, for example AES/GCM/NoPadding.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "Cipher\s*\.\s*getInstance\s*\(\s*""[^""]*(CBC|ECB)/PKCS5Padding") And Not CodeLine.Contains("GCM") Then
+            frmMain.ListCodeIssue("Unauthenticated Encryption Mode", "CBC with PKCS#5 padding provides confidentiality but no integrity. Where the application returns distinguishable errors for padding failures this permits padding-oracle decryption and, in some designs, forgery. Use an AEAD mode such as GCM, or apply Encrypt-then-MAC with a separate key.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bNullCipher\b") Then
+            frmMain.ListCodeIssue("Use of NullCipher", "NullCipher performs no encryption whatsoever and returns the plaintext unchanged.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        '== Hard-coded keys, IVs and salts ==
+        If Regex.IsMatch(CodeLine, "new\s+(SecretKeySpec|IvParameterSpec|PBEKeySpec|GCMParameterSpec)\s*\(") And Regex.IsMatch(CodeLine, "(""[^""]{4,}""\s*\.\s*getBytes|new\s+byte\s*\[\s*\]\s*\{)") Then
+            frmMain.ListCodeIssue("Hard-Coded Cryptographic Key, IV or Salt", "Key or IV material is derived from a literal embedded in the class file. String constants survive compilation intact and are recovered instantly with javap or any decompiler, so the encryption offers no protection against an attacker holding the ciphertext and the application. Keys must come from a keystore, KMS or HSM, and IVs must be random per message.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        '== Weak key sizes ==
+        mchMatch = Regex.Match(CodeLine, "\b(KeyPairGenerator|KeyGenerator)\b[^;]*\.\s*init(ialize)?\s*\(\s*(\d+)")
+        If mchMatch.Success Then
+            If Integer.TryParse(mchMatch.Groups(3).Value, intKeySize) Then
+                If (intKeySize > 0 And intKeySize < 2048 And intKeySize > 512) Or intKeySize = 512 Or intKeySize = 1024 Then
+                    frmMain.ListCodeIssue("Potentially Insufficient Key Length", "A key of " & intKeySize.ToString() & " bits is generated. For RSA/DSA/DH this is below the 2048-bit minimum required by current guidance; for symmetric keys anything below 128 bits is inadequate. Confirm the algorithm and raise the key size accordingly.", FileName, CodeIssue.MEDIUM, CodeLine)
+                End If
+            End If
+        End If
+
+        '== Predictable randomness for security-relevant values ==
+        If Regex.IsMatch(CodeLine, "\bnew\s+java\.util\.Random\s*\(|\bnew\s+Random\s*\(|\bMath\s*\.\s*random\s*\(") And _
+           Regex.IsMatch(CodeLine, "(?i)\b\w*(token|session|nonce|salt|key|password|otp|secret|csrf|uuid|reset)\w*\b") Then
+            frmMain.ListCodeIssue("Predictable Random Value Used For Security Purpose", "java.util.Random is a linear congruential generator seeded from the system clock. Observing a small number of outputs allows the internal state - and therefore all past and future outputs - to be recovered. Use java.security.SecureRandom for tokens, salts, nonces and identifiers.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "SecureRandom\s*\(\s*""[^""]+""\s*\.\s*getBytes|\bsetSeed\s*\(\s*(\d+|""[^""]*""|System\s*\.\s*currentTimeMillis)") Then
+            frmMain.ListCodeIssue("SecureRandom Seeded With Predictable Value", "Seeding SecureRandom with a constant or with the current time destroys its unpredictability and makes all generated values reproducible by an attacker. Allow SecureRandom to self-seed from the operating system entropy source.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckJavaTrustManager(CodeLine As String, FileName As String)
+        ' Identify disabled TLS certificate and hostname verification
+        '============================================================
+
+        If Regex.IsMatch(CodeLine, "\b(ALLOW_ALL_HOSTNAME_VERIFIER|AllowAllHostnameVerifier|NoopHostnameVerifier|SSLSocketFactory\s*\.\s*ALLOW_ALL)\b") Then
+            frmMain.ListCodeIssue("Hostname Verification Disabled", "The connection accepts a certificate regardless of the hostname it was issued for. Any valid certificate from any public CA - including one an attacker legitimately owns - will then be accepted for this host, defeating TLS authentication.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bverify\s*\(\s*String\s+\w+\s*,\s*SSLSession\s+\w+\s*\)") Or Regex.IsMatch(CodeLine, "setHostnameVerifier\s*\(") Then
+            frmMain.ListCodeIssue("Custom Hostname Verifier Installed", "A custom HostnameVerifier is supplied. Manually confirm that it actually compares the requested host against the certificate CN/SAN; an implementation which simply returns true accepts any certificate.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(X509TrustManager|TrustManager\s*\[\s*\]|checkServerTrusted|checkClientTrusted|TrustAllCerts|TrustSelfSignedStrategy|TrustAllStrategy)\b") Then
+            frmMain.ListCodeIssue("Custom Or Permissive TrustManager", "A custom TrustManager is defined. Where checkServerTrusted has an empty body, or getAcceptedIssuers returns null, every certificate is trusted and the connection provides no protection against active interception. This is the single most common TLS defect in Java and Android code.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "SSLContext\s*\.\s*getInstance\s*\(\s*""\s*(SSL|SSLv2|SSLv3|TLSv1|TLSv1\.1)\s*""") Then
+            frmMain.ListCodeIssue("Obsolete TLS/SSL Protocol Version", "SSLv2, SSLv3, TLS 1.0 and TLS 1.1 are deprecated by RFC 8996 and vulnerable to POODLE and BEAST. Request TLSv1.2 or TLSv1.3.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        '== Android specific ==
+        If asAppSettings.IsAndroid = True Then
+            If Regex.IsMatch(CodeLine, "\bonReceivedSslError\b") Or Regex.IsMatch(CodeLine, "\bSslErrorHandler\b[^;]*\.\s*proceed\s*\(") Then
+                frmMain.ListCodeIssue("WebView SSL Errors Ignored", "onReceivedSslError calls proceed(), instructing the WebView to load content despite a certificate failure. Any network attacker can then serve arbitrary content into the WebView, which frequently has JavaScript bridges into native code.", FileName, CodeIssue.CRITICAL, CodeLine)
+            End If
+            If Regex.IsMatch(CodeLine, "usesCleartextTraffic\s*=\s*""true""") Or Regex.IsMatch(CodeLine, "cleartextTrafficPermitted\s*=\s*""true""") Then
+                frmMain.ListCodeIssue("Cleartext Network Traffic Permitted", "The application manifest or network security configuration allows plain HTTP. Traffic is then readable and modifiable by anyone on the network path.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+
+    End Sub
+
+    Private Sub CheckJavaPathTraversal(CodeLine As String, FileName As String)
+        ' Identify filesystem operations driven by user-controlled data
+        '==============================================================
+
+        If Regex.IsMatch(CodeLine, "\bnew\s+(File|FileInputStream|FileOutputStream|FileReader|FileWriter|RandomAccessFile)\s*\(") Or _
+           Regex.IsMatch(CodeLine, "\b(Paths\s*\.\s*get|Files\s*\.\s*(newInputStream|newOutputStream|readAllBytes|readAllLines|write|delete|copy|move))\s*\(") Then
+            If IsUserInputJava(CodeLine) Then
+                frmMain.ListCodeIssue("Potential Path Traversal", "A filesystem path is constructed from request data. Sequences such as '../' or an absolute path in the input allow an attacker to read, overwrite or delete files outside the intended directory - typically configuration files, key material or application code. Canonicalise with getCanonicalPath() and verify the result is still under the intended base directory, or map the input to a fixed set of identifiers.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+
+        '== Zip Slip ==
+        If Regex.IsMatch(CodeLine, "\b(ZipEntry|TarArchiveEntry|ZipArchiveEntry)\b[^;]*\.\s*getName\s*\(") Or _
+           (Regex.IsMatch(CodeLine, "\bgetNextEntry\s*\(") And Regex.IsMatch(CodeLine, "\bnew\s+File\s*\(")) Then
+            frmMain.ListCodeIssue("Potential Zip Slip During Archive Extraction", "An archive entry name is used to build an output path. Entry names are attacker-controlled and may contain '../' sequences, allowing files to be written outside the extraction directory - overwriting web-accessible scripts, cron files or libraries and frequently achieving code execution. Resolve the destination and verify it starts with the canonical extraction root before writing.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckJavaSSRF(CodeLine As String, FileName As String)
+        ' Identify outbound requests whose destination is user-controlled
+        '================================================================
+
+        If Regex.IsMatch(CodeLine, "\bnew\s+(URL|URI|HttpGet|HttpPost|Request\.Builder)\s*\(") Or _
+           Regex.IsMatch(CodeLine, "\b(RestTemplate|WebClient|HttpClient|OkHttpClient|URLConnection|HttpURLConnection|IOUtils\s*\.\s*toString)\b") Then
+            If IsUserInputJava(CodeLine) Then
+                frmMain.ListCodeIssue("Potential Server-Side Request Forgery (SSRF)", "The target of an outbound request appears to derive from user input. This allows an attacker to reach services bound to loopback or private ranges, to query cloud instance metadata endpoints for credentials, and to use the server as a proxy for port scanning. Validate against a host allow-list after DNS resolution, reject private and link-local addresses, and disable redirect following.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+
+    End Sub
+
+    Private Sub CheckJavaExpressionInjection(CodeLine As String, FileName As String)
+        ' Identify expression language, template and script injection sinks
+        '==================================================================
+
+        If Regex.IsMatch(CodeLine, "\b(SpelExpressionParser|ExpressionParser|parseExpression|StandardEvaluationContext)\b") Then
+            frmMain.ListCodeIssue("Potential Spring Expression Language (SpEL) Injection", "A SpEL expression is parsed at runtime. SpEL permits arbitrary method invocation, including T(java.lang.Runtime).getRuntime().exec(), so an attacker-controlled expression yields remote code execution. Use SimpleEvaluationContext rather than StandardEvaluationContext and never build the expression from request data.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(Ognl\s*\.\s*(getValue|parseExpression)|MVEL\s*\.\s*(eval|executeExpression)|ELProcessor|ExpressionFactory\s*\.\s*createValueExpression)\b") Then
+            frmMain.ListCodeIssue("Potential OGNL/MVEL/EL Injection", "An expression language interpreter evaluates a runtime string. These interpreters expose the full Java object graph and have historically produced critical remote code execution issues (for example the Struts 2 OGNL series). Remove the dynamic evaluation or restrict it to a sandboxed member access policy.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(ScriptEngineManager|ScriptEngine\s*\.\s*eval|GroovyShell|GroovyClassLoader|Binding\s*\(\s*\)|JexlEngine)\b") Then
+            frmMain.ListCodeIssue("Runtime Script Evaluation", "A scripting engine (Nashorn, Groovy, JEXL) evaluates code at runtime. Where any portion of the script derives from user input this is a direct remote code execution primitive. Groovy in particular provides no sandbox by default.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(Velocity\s*\.\s*evaluate|freemarker\.template|new\s+Template\s*\(|TemplateEngine\s*\.\s*process|Pebble|Thymeleaf)\b") And IsUserInputJava(CodeLine) Then
+            frmMain.ListCodeIssue("Potential Server-Side Template Injection", "A template is compiled from a string which appears to include user input. Velocity, FreeMarker and Thymeleaf all permit access to Java objects from within a template, converting template injection into code execution. Templates must be static resources; user data belongs in the model only.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckJavaJndiInjection(CodeLine As String, FileName As String)
+        ' Identify JNDI lookups and logging patterns associated with Log4Shell
+        '=====================================================================
+
+        If Regex.IsMatch(CodeLine, "\b(InitialContext|InitialDirContext|Context\s*\.\s*lookup|\.lookup\s*\(|JndiTemplate|JndiObjectFactoryBean|RegistryConnector)\b") Then
+            frmMain.ListCodeIssue("Potential JNDI Injection", "A JNDI lookup is performed. Where the name is influenced by user input an attacker supplies an ldap:// or rmi:// URI pointing at their own directory server, which returns a serialised or remote-classloading payload that the JVM instantiates - remote code execution. Restrict lookups to a fixed set of names and ensure com.sun.jndi.ldap.object.trustURLCodebase remains false.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\$\{jndi\s*:") Then
+            frmMain.ListCodeIssue("JNDI Lookup Expression Present In Source", "A ${jndi:...} expression appears in the source or a resource file. This is the Log4Shell (CVE-2021-44228) exploitation syntax. Confirm whether this is a test artefact or a genuine lookup and verify the log4j-core version in use.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "log4j-core") And Regex.IsMatch(CodeLine, "\b(1\.\d|2\.([0-9]|1[0-6])(\.\d+)?)\b") Then
+            frmMain.ListCodeIssue("Potentially Vulnerable log4j Version", "The dependency declaration references a log4j-core version at or below 2.16. Versions before 2.17.1 are affected by one or more of CVE-2021-44228, CVE-2021-45046 and CVE-2021-45105; log4j 1.x is end-of-life and carries its own JMSAppender deserialisation issue. Confirm the effective resolved version.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckJavaLdapXPath(CodeLine As String, FileName As String)
+        ' Identify LDAP and XPath queries built through concatenation
+        '============================================================
+
+        If Regex.IsMatch(CodeLine, "\.\s*search\s*\(") And (CodeLine.Contains("+") Or Regex.IsMatch(CodeLine, "String\s*\.\s*format|concat\s*\(")) Then
+            frmMain.ListCodeIssue("Potential LDAP Injection", "An LDAP search filter appears to be assembled by concatenation. Metacharacters such as '*', '(', ')' and '\' let an attacker rewrite the filter to authenticate without a password or to enumerate every entry in the directory. Escape input per RFC 4515 or bind the filter arguments using the Object[] overload of DirContext.search.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\bXPath\w*\b[^;]*\.\s*(compile|evaluate|selectNodes|selectSingleNode)\s*\(") And (CodeLine.Contains("+") Or CodeLine.Contains("concat")) Then
+            frmMain.ListCodeIssue("Potential XPath Injection", "An XPath expression is built by concatenation. Injected quotes and boolean operators allow authentication bypass and disclosure of the whole XML document. Use XPathVariableResolver to bind values rather than embedding them in the expression.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckSpringSecurityConfig(CodeLine As String, FileName As String)
+        ' Identify weakened Spring Security and framework configuration
+        '==============================================================
+
+        If Regex.IsMatch(CodeLine, "\bcsrf\s*\(\s*\)\s*\.\s*disable\s*\(|csrf\s*\(\s*(AbstractHttpConfigurer\s*::\s*disable|\w+\s*->\s*\w+\s*\.\s*disable)") Then
+            frmMain.ListCodeIssue("CSRF Protection Disabled", "Spring Security's CSRF filter has been switched off. Where the application authenticates using cookies this allows any site to trigger state-changing requests with the victim's session. Disabling CSRF is only defensible for a stateless API that authenticates solely via a bearer token which is never sent automatically by the browser.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\banyRequest\s*\(\s*\)\s*\.\s*(permitAll|anonymous)\s*\(") Then
+            frmMain.ListCodeIssue("All Requests Permitted Without Authentication", "The security configuration allows every request without authentication. Confirm that authorisation is genuinely enforced elsewhere, for example by method-level annotations.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "@CrossOrigin\s*\(\s*(origins\s*=\s*)?""\s*\*|setAllowedOrigins\s*\([^\)]*""\s*\*|addAllowedOrigin\s*\(\s*""\s*\*") Then
+            frmMain.ListCodeIssue("Overly Permissive CORS Configuration", "Any origin may read responses from this endpoint. Where combined with setAllowCredentials(true) this permits authenticated cross-origin reads from arbitrary sites, which is a full account compromise primitive.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\b(NoOpPasswordEncoder|withDefaultPasswordEncoder|StandardPasswordEncoder|MessageDigestPasswordEncoder)\b") Then
+            frmMain.ListCodeIssue("Insecure Password Encoder", "NoOpPasswordEncoder stores passwords in cleartext; StandardPasswordEncoder and MessageDigestPasswordEncoder use a fast digest that is unsuitable for password storage and are deprecated. Use BCryptPasswordEncoder or Argon2PasswordEncoder via DelegatingPasswordEncoder.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\b(headers\s*\(\s*\)\s*\.\s*(frameOptions|disable)|frameOptions\s*\(\s*\)\s*\.\s*disable)\b") Then
+            frmMain.ListCodeIssue("Security Response Headers Disabled", "Framing protection or the default security header set has been disabled, exposing users to clickjacking and removing MIME-sniffing and referrer protections.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "\b(actuator|management\.endpoints\.web\.exposure\.include)\b") And Regex.IsMatch(CodeLine, "(\*|env|heapdump|threaddump|jolokia|shutdown)") Then
+            frmMain.ListCodeIssue("Spring Actuator Endpoints Broadly Exposed", "Management endpoints are exposed. /env and /configprops disclose configuration including credentials, /heapdump yields a full memory image containing session tokens, and /jolokia has repeatedly been used to reach remote code execution. Expose only /health and require authentication.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckJavaJwt(CodeLine As String, FileName As String)
+        ' Identify weak JSON Web Token handling
+        '======================================
+
+        If Regex.IsMatch(CodeLine, "\.\s*(parseClaimsJwt|parsePlaintextJwt)\s*\(") Then
+            frmMain.ListCodeIssue("Unsigned JWT Accepted", "parseClaimsJwt parses an unsigned token. Every claim it returns - including identity and roles - is supplied by the client with no cryptographic verification. Use parseClaimsJws with a configured signing key.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bAlgorithm\s*\.\s*none\s*\(|""\s*alg\s*""\s*:\s*""\s*none") Then
+            frmMain.ListCodeIssue("JWT 'none' Algorithm In Use", "The 'none' algorithm disables signature verification entirely, allowing any client to mint a token with arbitrary claims.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(setSigningKey|Algorithm\s*\.\s*HMAC\d+)\s*\(\s*""[^""]{1,}""") Then
+            frmMain.ListCodeIssue("Hard-Coded JWT Signing Secret", "The HMAC secret used to sign tokens is a literal in source. Recovery of the secret allows an attacker to forge tokens for any user. Store it in a secrets manager and ensure it carries at least 256 bits of entropy - short secrets are also recoverable by offline brute force against a captured token.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(requireExpiration|setAllowedClockSkewSeconds)\s*\(\s*\d{4,}") Then
+            frmMain.ListCodeIssue("Excessive JWT Clock Skew Tolerance", "A very large clock skew allowance effectively extends token lifetime well beyond the stated expiry, increasing the window in which a stolen token remains usable.", FileName, CodeIssue.LOW, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckJavaDeserializationExtended(CodeLine As String, FileName As String)
+        ' Additional deserialization surfaces beyond the existing check
+        '==============================================================
+
+        If Regex.IsMatch(CodeLine, "\bnew\s+XStream\s*\(") Then
+            frmMain.ListCodeIssue("XStream Deserialization", "XStream reconstructs arbitrary types named in the XML document. Unless an explicit allow-list is configured via addPermission/allowTypes this is a remote code execution sink with a long history of bypasses. Configure XStream.setupDefaultSecurity and an explicit type allow-list.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(enableDefaultTyping|activateDefaultTyping|JSON\s*\.\s*parseObject\s*\([^\)]*Feature\.SupportAutoType|@JsonTypeInfo\s*\(\s*use\s*=\s*Id\.CLASS)\b") Then
+            frmMain.ListCodeIssue("Polymorphic Type Handling Enabled In JSON Parser", "Jackson default typing (or Fastjson AutoType) instantiates the class named inside the JSON document. Numerous gadget chains exist in common libraries that turn this into remote code execution. Disable default typing, or restrict it with a strict PolymorphicTypeValidator.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bnew\s+Yaml\s*\(\s*\)|Yaml\s*\.\s*load\s*\(") Then
+            frmMain.ListCodeIssue("Unsafe YAML Deserialization", "SnakeYAML's default constructor permits arbitrary type instantiation through the !!javaObject tag, which is a known code execution sink. Use new Yaml(new SafeConstructor()) or Yaml.loadAs with an explicit type.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bBeanUtils\s*\.\s*populate|\bBeanUtilsBean\b|\bWrapDynaBean\b") Then
+            frmMain.ListCodeIssue("Potential Mass Assignment Via BeanUtils", "BeanUtils.populate sets bean properties from a request map. Where the bean exposes a 'class' getter this reaches the classloader (the Struts/Spring 'class.module.classLoader' issue) and permits remote code execution; more generally it permits over-posting of privileged fields.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckJavaHardcodedSecrets(CodeLine As String, FileName As String)
+        ' Identify credentials and API keys embedded in source or resources
+        '==================================================================
+
+        If Regex.IsMatch(CodeLine, "AKIA[0-9A-Z]{16}") Then
+            frmMain.ListCodeIssue("Hard-Coded AWS Access Key", "A string matching the AWS access key ID format is present. Revoke it and move to an instance role or a secrets manager.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "(gh[pousr]_[A-Za-z0-9]{36}|xox[baprs]-[A-Za-z0-9\-]{10,}|sk_live_[0-9a-zA-Z]{24,}|AIza[0-9A-Za-z\-_]{35})") Then
+            frmMain.ListCodeIssue("Hard-Coded Third-Party API Token", "A GitHub, Slack, Stripe or Google API token appears to be embedded in source or resources.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "-----BEGIN\s+(RSA|EC|DSA|OPENSSH|PGP)?\s*PRIVATE KEY") Then
+            frmMain.ListCodeIssue("Private Key Embedded In Source", "A PEM-encoded private key is stored in the repository. The associated identity must be treated as compromised.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "(?i)\b(String|char\s*\[\s*\]|final)\b[^=]*\b\w*(password|passwd|pwd|secret|apikey|api_key|token|privatekey|clientsecret|keystorepass)\w*\s*=\s*""[^""]{3,}""") Then
+            frmMain.ListCodeIssue("Hard-Coded Secret Assigned To Variable", "A field whose name indicates a credential is initialised with a literal. String constants are stored in the class constant pool and are recovered directly from the compiled artefact.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "jdbc:[a-z]+://[^""]*(password|pwd)=") Then
+            frmMain.ListCodeIssue("Database Password In JDBC URL", "A JDBC connection string contains an inline password. Connection strings are frequently written to logs and stack traces.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckJavaLogging(CodeLine As String, FileName As String)
+        ' Identify sensitive data and unsanitised input written to logs
+        '==============================================================
+
+        If Regex.IsMatch(CodeLine, "\b(log|logger|LOG|LOGGER|System\s*\.\s*(out|err))\b[^;]*\.\s*(debug|info|warn|error|trace|print|println)\s*\(") Then
+            If Regex.IsMatch(CodeLine, "(?i)\b\w*(password|passwd|pwd|secret|token|apikey|api_key|creditcard|ssn|cvv|authorization|sessionid|cookie)\w*\b") Then
+                frmMain.ListCodeIssue("Sensitive Data Written To Log", "A credential, token or other sensitive value appears to be written to the application log. Logs are typically retained longer than the data, replicated to aggregation platforms and readable by a far wider audience than the production database.", FileName, CodeIssue.HIGH, CodeLine)
+            ElseIf IsUserInputJava(CodeLine) Then
+                frmMain.ListCodeIssue("Unsanitised User Input Written To Log", "Request data is written to the log without neutralising carriage return and line feed characters. An attacker can therefore forge additional log entries, obscuring their activity or misleading incident responders. Where logs are rendered in a web console this also becomes stored cross-site scripting.", FileName, CodeIssue.MEDIUM, CodeLine)
+            End If
+        End If
+
+    End Sub
+
+    Private Sub CheckAndroidComponentSecurity(CodeLine As String, FileName As String)
+        ' Android-specific component, storage and WebView issues
+        '=======================================================
+
+        If asAppSettings.IsAndroid = False Then Exit Sub
+
+        '== WebView configuration ==
+        If Regex.IsMatch(CodeLine, "\baddJavascriptInterface\s*\(") Then
+            frmMain.ListCodeIssue("WebView JavaScript Bridge Exposed", "addJavascriptInterface exposes a Java object to any page loaded in the WebView. On API levels below 17 this permits reflection to Runtime.exec from JavaScript; on later levels only @JavascriptInterface methods are reachable, but any such method still becomes an entry point for hostile content loaded over a compromised connection.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(setAllowFileAccessFromFileURLs|setAllowUniversalAccessFromFileURLs|setAllowFileAccess|setAllowContentAccess)\s*\(\s*true\s*\)") Then
+            frmMain.ListCodeIssue("WebView Local File Access Enabled", "The WebView is permitted to read local files or to grant file:// pages universal origin access. A single cross-site scripting flaw, or any redirect to a file:// URL, then allows exfiltration of the application's private data directory.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "setJavaScriptEnabled\s*\(\s*true\s*\)") Then
+            frmMain.ListCodeIssue("JavaScript Enabled In WebView", "JavaScript execution is enabled. Confirm that only trusted, integrity-protected content is ever loaded and that a WebViewClient restricts navigation to an allow-list of hosts.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        '== Insecure local storage ==
+        If Regex.IsMatch(CodeLine, "\bMODE_WORLD_(READABLE|WRITEABLE|WRITABLE)\b") Then
+            frmMain.ListCodeIssue("World-Accessible File Mode", "The file or preference store is created with world-readable or world-writable permissions, exposing it to every other application on the device. These modes have been deprecated and throw SecurityException from API 24 onwards.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(getExternalStorageDirectory|getExternalFilesDir|getExternalCacheDir|Environment\s*\.\s*DIRECTORY_)\b") Then
+            frmMain.ListCodeIssue("Data Written To External Storage", "External storage is world-readable to any application holding READ_EXTERNAL_STORAGE and survives application uninstall. Sensitive material must be kept in internal storage, and encrypted where the device may be rooted.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bgetSharedPreferences\s*\(") And Regex.IsMatch(CodeLine, "(?i)(password|token|secret|key|credential)") Then
+            frmMain.ListCodeIssue("Credentials In SharedPreferences", "SharedPreferences are stored as plaintext XML in the application data directory, which is readable on a rooted or backed-up device. Use EncryptedSharedPreferences or the Android Keystore.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        '== Exported components and backup ==
+        If Regex.IsMatch(CodeLine, "android:exported\s*=\s*""true""") Then
+            frmMain.ListCodeIssue("Exported Application Component", "The component is reachable by any other application on the device. Unless it is protected by a signature-level permission, confirm that it performs its own authorisation checks and validates all Intent extras.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "android:(allowBackup|debuggable)\s*=\s*""true""") Then
+            frmMain.ListCodeIssue("Backup Or Debug Flag Enabled In Manifest", "allowBackup permits the full application data directory to be extracted over ADB without root; debuggable allows a debugger to attach to the production application and read process memory. Both must be false in release builds.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        '== Broadcast and pending intents ==
+        If Regex.IsMatch(CodeLine, "\bsendBroadcast\s*\(") And Not CodeLine.Contains("permission") Then
+            frmMain.ListCodeIssue("Unprotected Broadcast Sent", "The broadcast is sent without a receiver permission, so any application registered for the action receives the Intent and its extras. Use LocalBroadcastManager or specify a signature-level permission.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bPendingIntent\s*\.\s*get(Activity|Broadcast|Service)\s*\(") And Not Regex.IsMatch(CodeLine, "FLAG_IMMUTABLE") Then
+            frmMain.ListCodeIssue("Mutable PendingIntent", "A PendingIntent is created without FLAG_IMMUTABLE. The receiving application can fill in the unpopulated fields and cause the Intent to be dispatched with this application's identity and permissions.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+    End Sub
 End Module

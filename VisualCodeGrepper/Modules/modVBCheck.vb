@@ -46,7 +46,21 @@ Module modVBCheck
         CheckOpenRedirect(CodeLine, FileName)           ' Check for potential open redirect vulnerabilities
         CheckXXE(CodeLine, FileName)                    ' Check for XXE
         CheckUnrestrictedFileUpload(CodeLine, FileName) ' Check for Unrestricted File Upload
-        CheckProcessInjection(CodeLine, FileName)       ' Check for potential process injection or hollowing techniques
+        CheckUnsafeMemoryOperationsVB(CodeLine, FileName)       ' Check for potential process injection or hollowing techniques
+
+        '== Extended ruleset ==
+        CheckVBWeakCryptography(CodeLine, FileName)      ' Broken hashes/ciphers, ECB, hard-coded keys, weak KDF and key sizes
+        CheckVBCertificateValidation(CodeLine, FileName) ' Disabled TLS cert validation and obsolete protocol versions
+        CheckVBPathTraversal(CodeLine, FileName)         ' User-controlled filesystem paths and Zip Slip
+        CheckVBSSRF(CodeLine, FileName)                  ' User-controlled outbound request destinations
+        CheckVBDeserializationExtended(CodeLine, FileName) ' TypeNameHandling, unsafe formatters, ViewState MAC and machineKey
+        CheckVBCookieAndSession(CodeLine, FileName)      ' Insecure cookie flags, cookieless sessions, disabled anti-forgery
+        CheckVBCorsPolicy(CodeLine, FileName)            ' Permissive or credentialed CORS configuration
+        CheckVBHardcodedSecrets(CodeLine, FileName)      ' API keys, private keys and credentials embedded in source
+        CheckVBDynamicCodeExecution(CodeLine, FileName)  ' Assembly loading, runtime compilation, CallByName, process launch
+        CheckVBInformationLeakage(CodeLine, FileName)    ' Exception detail returned to client, On Error Resume Next
+        CheckVBHeaderInjection(CodeLine, FileName)       ' Response splitting and Host header trust
+        CheckVBAuthorisationWeakness(CodeLine, FileName) ' Weak password policy, lockout and impersonation handling
 
         If Regex.IsMatch(CodeLine, "\S*(Password|password|pwd|passwd)\S*\.(ToLower|ToUpper)\s*\(") Then
             frmMain.ListCodeIssue("Unsafe Password Management", "The application appears to handle passwords in a case-insensitive manner. This can greatly increase the likelihood of successful brute-force and/or dictionary attacks.", FileName, CodeIssue.MEDIUM, CodeLine)
@@ -361,38 +375,6 @@ Module modVBCheck
         End If
     End Sub
 
-    Public Sub CheckProcessInjection(CodeLine As String, FileName As String)
-        ' Check for potential process injection or hollowing techniques
-        '=========================================================================
-
-        Dim blnIsFound As Boolean
-        blnIsFound = False
-
-        ' List of keywords related to process injection/hollowing
-        If Regex.IsMatch(CodeLine.ToLower(), "createremotethread|writeprocessmemory|virtualallocex|ntunmapviewofsection|setthreadcontext|resumethread|rtlcreateprocessreflection|ntgetnextprocess") Then
-            ' Check for potential code injection patterns
-            For Each strVar In ctCodeTracker.InputVars
-                ' If the line contains a user-controlled variable, raise a critical issue
-                If CodeLine.Contains(strVar) Then
-                    frmMain.ListCodeIssue("Potential Process Injection Technique",
-                "The code contains potential process injection/hollowing techniques with user-controlled variables.",
-                FileName, CodeIssue.CRITICAL, CodeLine)
-                    blnIsFound = True
-                    Exit For
-                End If
-            Next
-
-            ' If no user-controlled variables are found
-            If blnIsFound = False Then
-                ' Raise a high-priority issue for manual review
-                frmMain.ListCodeIssue("Process Injection Technique Detected",
-            "The code contains potential process injection/hollowing techniques. Manual review required to check for misuse.",
-            FileName, CodeIssue.HIGH, CodeLine)
-            End If
-        End If
-
-    End Sub
-
     Private Sub CheckMisconfiguredRoutes(CodeLine As String, FileName As String)
         ' Check for potential misconfigurations in routes and HTTP methods defined in enum.Rules
         '=======================================================================================
@@ -439,5 +421,315 @@ Module modVBCheck
         Next
     End Sub
 
+    Public Sub CheckUnsafeMemoryOperationsVB(CodeLine As String, FileName As String)
+        Dim blnIsFound As Boolean
+        blnIsFound = False
 
+        ' Keywords related to memory operations and process injection/hollowing
+        Dim memoryAndInjectionKeywords As String = "virtualallocex|writeprocessmemory|createremotethread|ntunmapviewofsection|setthreadcontext|resumethread|rtlcreateprocessreflection|ntgetnextprocess|heapalloc|heapfree"
+
+        ' Check for both unsafe memory operations and process injection techniques
+        If Regex.IsMatch(CodeLine.ToLower(), memoryAndInjectionKeywords) Then
+            ' Check for user-controlled variables used in these operations
+            For Each strVar In ctCodeTracker.InputVars
+                If CodeLine.Contains(strVar) Then
+                    frmMain.ListCodeIssue("Potential Unsafe Memory Operation or Process Injection",
+                "The code contains potential unsafe memory operations or process injection/hollowing techniques with user-controlled variables.",
+                FileName, CodeIssue.CRITICAL, CodeLine)
+                    blnIsFound = True
+                    Exit For
+                End If
+            Next
+
+            ' If no user-controlled variables are found
+            If blnIsFound = False Then
+                frmMain.ListCodeIssue("Unsafe Memory Operation or Process Injection Detected",
+            "The code contains potential unsafe memory operations or process injection/hollowing techniques. Manual review required to check for misuse.",
+            FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+    End Sub
+
+
+    '======================================================================================
+    '== EXTENDED RULESET                                                                 ==
+    '== Additional checks appended without altering any pre-existing logic.              ==
+    '======================================================================================
+
+    Private Function IsUserInputVB(CodeLine As String) As Boolean
+        ' Return True where the line appears to reference a tainted (user-controlled) source
+        '==================================================================================
+
+        If Regex.IsMatch(CodeLine, "\bRequest\s*(\.\s*(QueryString|Form|Params|Cookies|Headers|Files|Url|RawUrl|UserAgent|UrlReferrer|Item|ServerVariables)|\()") Then Return True
+        If Regex.IsMatch(CodeLine, "\bHttpContext\s*\.\s*(Current\s*\.\s*)?Request\b") Then Return True
+        If Regex.IsMatch(CodeLine, "<\s*From(Query|Body|Form|Route|Header)\s*>") Then Return True
+        If Regex.IsMatch(CodeLine, "\b(Console\s*\.\s*ReadLine|Environment\s*\.\s*GetEnvironmentVariable|Environment\s*\.\s*GetCommandLineArgs|InputBox)\b") Then Return True
+        If Regex.IsMatch(CodeLine, "\b\w*(txt|input|param|query|user)\w*\s*\.\s*Text\b") Then Return True
+
+        For Each strVar In ctCodeTracker.InputVars
+            If strVar <> "" AndAlso CodeLine.Contains(strVar) Then Return True
+        Next
+
+        Return False
+
+    End Function
+
+    Private Sub CheckVBWeakCryptography(CodeLine As String, FileName As String)
+        ' Identify broken cryptographic primitives, unsafe modes and weak key derivation
+        '===============================================================================
+        Dim mchMatch As Match
+        Dim intIterations As Integer = 0
+        Dim intKeySize As Integer = 0
+
+
+        '== Broken hash algorithms ==
+        If Regex.IsMatch(CodeLine, "\b(MD5|MD4|SHA1|RIPEMD160)(CryptoServiceProvider|Managed|Cng)?\s*\.\s*Create\s*\(") Or _
+           Regex.IsMatch(CodeLine, "\bNew\s+(MD5|SHA1|RIPEMD160)(CryptoServiceProvider|Managed|Cng)\b") Or _
+           Regex.IsMatch(CodeLine, "\b(HMACMD5|HMACRIPEMD160)\b") Or _
+           Regex.IsMatch(CodeLine, "(HashAlgorithm|CryptoConfig)\s*\.\s*Create\s*\(\s*""\s*(MD5|SHA1|SHA-1|MD4)") Then
+            frmMain.ListCodeIssue("Use of Broken or Deprecated Hashing Algorithm", "The code uses MD4, MD5, SHA-1 or RIPEMD-160, for which practical collision attacks exist. These are unsuitable for signatures, integrity verification and password storage. Move to SHA-256 or better, and use a purpose-built KDF for passwords.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        '== Broken symmetric ciphers ==
+        If Regex.IsMatch(CodeLine, "\b(DES|TripleDES|RC2)(CryptoServiceProvider|Managed|Cng)?\s*\.\s*Create\s*\(") Or _
+           Regex.IsMatch(CodeLine, "\bNew\s+(DES|TripleDES|RC2)(CryptoServiceProvider|Managed|Cng)\b") Then
+            frmMain.ListCodeIssue("Use of Broken or Deprecated Symmetric Cipher", "DES has an effective 56-bit key and is brute-forceable; Triple-DES and RC2 use 64-bit blocks and are exposed to Sweet32 birthday attacks. Use AES-256 in GCM mode.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bCipherMode\s*\.\s*ECB\b") Then
+            frmMain.ListCodeIssue("Use of ECB Cipher Mode", "ECB encrypts each block independently, so identical plaintext blocks produce identical ciphertext. Plaintext structure leaks and blocks can be reordered or replayed by an attacker.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        '== Hard-coded key material ==
+        If Regex.IsMatch(CodeLine, "\.\s*(Key|IV)\s*=\s*(Encoding\s*\.\s*\w+\s*\.\s*GetBytes\s*\(\s*""|Convert\s*\.\s*FromBase64String\s*\(\s*""|New\s+Byte\s*\(\s*\)\s*\{)") Then
+            frmMain.ListCodeIssue("Hard-Coded Cryptographic Key or IV", "Key or IV material is embedded in source and is recoverable from the compiled assembly with any decompiler. Source keys from DPAPI, a key vault or an HSM, and generate IVs randomly per message.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        '== Weak key sizes ==
+        mchMatch = Regex.Match(CodeLine, "\bNew\s+(RSACryptoServiceProvider|DSACryptoServiceProvider|RSACng)\s*\(\s*(\d+)")
+        If mchMatch.Success Then
+            If Integer.TryParse(mchMatch.Groups(2).Value, intKeySize) Then
+                If intKeySize > 0 And intKeySize < 2048 Then
+                    frmMain.ListCodeIssue("Insufficient Asymmetric Key Length", "An RSA/DSA key of " & intKeySize.ToString() & " bits is generated. Keys below 2048 bits are no longer considered to provide an adequate security margin. Use 3072 bits or an elliptic-curve equivalent.", FileName, CodeIssue.HIGH, CodeLine)
+                End If
+            End If
+        End If
+
+        '== Weak password-based key derivation ==
+        If Regex.IsMatch(CodeLine, "\bNew\s+PasswordDeriveBytes\b") Then
+            frmMain.ListCodeIssue("Use of Obsolete Key Derivation Function", "PasswordDeriveBytes implements the obsolete PBKDF1. Use Rfc2898DeriveBytes with HashAlgorithmName.SHA256 and a high iteration count.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        mchMatch = Regex.Match(CodeLine, "\bNew\s+Rfc2898DeriveBytes\s*\([^\)]*?,\s*(\d{1,7})\s*[\),]")
+        If mchMatch.Success Then
+            If Integer.TryParse(mchMatch.Groups(1).Value, intIterations) Then
+                If intIterations < 100000 Then
+                    frmMain.ListCodeIssue("Insufficient PBKDF2 Iteration Count", "PBKDF2 is configured with " & intIterations.ToString() & " iterations. Current OWASP guidance is at least 600,000 for PBKDF2-HMAC-SHA256; a low work factor allows an attacker holding the hashes to test candidates at very high rates on commodity GPUs.", FileName, CodeIssue.MEDIUM, CodeLine)
+                End If
+            End If
+        End If
+
+        '== Passwords hashed with a general-purpose digest ==
+        If Regex.IsMatch(CodeLine, "(?i)\b\w*(password|passwd|pwd|secret)\w*\b") And Regex.IsMatch(CodeLine, "\b(ComputeHash|GetHashCode|HashPasswordForStoringInConfigFile)\b") Then
+            frmMain.ListCodeIssue("Password Stored Using an Unsuitable Hash", "A password appears to be passed to a general-purpose hash function. Fast hashes are unsuitable for password storage regardless of the algorithm. Use ASP.NET Identity's PasswordHasher, Argon2id or PBKDF2 with a per-user salt and a high work factor.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckVBCertificateValidation(CodeLine As String, FileName As String)
+        ' Identify disabled TLS certificate validation and obsolete protocol selection
+        '=============================================================================
+
+        If Regex.IsMatch(CodeLine, "(ServerCertificateValidationCallback|ServerCertificateCustomValidationCallback|RemoteCertificateValidationCallback)") And _
+           Regex.IsMatch(CodeLine, "(Return\s+True|Function\s*\(.*\)\s*True|AddressOf)") Then
+            frmMain.ListCodeIssue("TLS Certificate Validation Disabled Or Overridden", "The certificate validation callback appears to accept any certificate. This removes all protection against active man-in-the-middle attacks and reduces TLS to unauthenticated encryption. Where a custom callback is genuinely required, verify SslPolicyErrors is None, or pin the expected certificate thumbprint.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bDangerousAcceptAnyServerCertificateValidator\b") Then
+            frmMain.ListCodeIssue("TLS Certificate Validation Disabled", "All certificate verification is disabled for this HTTP handler, leaving connections open to interception.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "SecurityProtocolType\s*\.\s*(Ssl3|Tls|Tls11)\b") Or Regex.IsMatch(CodeLine, "SslProtocols\s*\.\s*(Ssl2|Ssl3|Tls|Tls11|None)\b") Then
+            frmMain.ListCodeIssue("Obsolete TLS/SSL Protocol Version Selected", "SSLv3, TLS 1.0 and TLS 1.1 are deprecated by RFC 8996 and vulnerable to POODLE, BEAST and downgrade attacks. Pin to TLS 1.2 or 1.3, or remove the assignment and let the platform negotiate.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "(CheckCertificateRevocationList|CheckCertificateRevocation)\s*=\s*False") Then
+            frmMain.ListCodeIssue("Certificate Revocation Checking Disabled", "Revoked certificates will still be accepted, so a compromised key remains usable against this application until it expires.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "RequireHttpsMetadata\s*=\s*False") Then
+            frmMain.ListCodeIssue("Authentication Metadata Retrieved Over Cleartext", "Discovery documents and signing keys may be fetched over plain HTTP, allowing a network attacker to substitute their own signing keys and forge tokens.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckVBPathTraversal(CodeLine As String, FileName As String)
+        ' Identify filesystem operations driven by user-controlled data
+        '==============================================================
+
+        If Regex.IsMatch(CodeLine, "\b(File|FileInfo|Directory|DirectoryInfo|FileStream|StreamReader|StreamWriter|Path\s*\.\s*Combine|Server\s*\.\s*MapPath|My\s*\.\s*Computer\s*\.\s*FileSystem)\b") Then
+            If IsUserInputVB(CodeLine) Then
+                frmMain.ListCodeIssue("Potential Path Traversal", "A filesystem path appears to be built from user input. Path.Combine offers no protection: a rooted path or '..' sequence in the second argument escapes the intended directory and permits arbitrary read, overwrite or deletion. Canonicalise with Path.GetFullPath and confirm the result remains under the intended base directory.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+
+        If Regex.IsMatch(CodeLine, "\b(ExtractToDirectory|ExtractToFile|ExtractAll|WriteToDirectory)\b") Then
+            frmMain.ListCodeIssue("Potential Zip Slip During Archive Extraction", "Archive entries are written to disk. Where the entry name is not validated a crafted '../' path writes outside the extraction directory, frequently allowing an attacker to overwrite application code. Resolve each entry and verify it remains under the destination root.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckVBSSRF(CodeLine As String, FileName As String)
+        ' Identify outbound requests whose destination is user-controlled
+        '================================================================
+
+        If Regex.IsMatch(CodeLine, "\b(WebRequest|HttpWebRequest|WebClient|HttpClient|FtpWebRequest)\b") Or Regex.IsMatch(CodeLine, "\bNew\s+Uri\s*\(") Or _
+           Regex.IsMatch(CodeLine, "\.\s*(DownloadString|DownloadData|DownloadFile|GetAsync|PostAsync|OpenRead)\s*\(") Then
+            If IsUserInputVB(CodeLine) Then
+                frmMain.ListCodeIssue("Potential Server-Side Request Forgery (SSRF)", "The destination of an outbound request appears to derive from user input, allowing an attacker to reach internal services, loopback addresses and cloud metadata endpoints from the server's network position. Validate the host against an allow-list after resolution and reject private ranges.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+
+    End Sub
+
+    Private Sub CheckVBDeserializationExtended(CodeLine As String, FileName As String)
+        ' Additional deserialization and ViewState surfaces
+        '==================================================
+
+        If Regex.IsMatch(CodeLine, "TypeNameHandling\s*\.\s*(All|Objects|Arrays|Auto)\b") Then
+            frmMain.ListCodeIssue("Json.NET TypeNameHandling Enabled", "TypeNameHandling instructs Json.NET to instantiate the CLR type named in the $type property of the incoming document. Gadget types present in the framework convert this directly into remote code execution. Set TypeNameHandling to None or supply a strict ISerializationBinder.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(LosFormatter|ObjectStateFormatter|NetDataContractSerializer|SoapFormatter|BinaryFormatter)\b") Then
+            frmMain.ListCodeIssue("Use of Unsafe .NET Formatter", "These formatters reconstruct arbitrary object graphs from type information contained in the payload and cannot be used safely on untrusted input. BinaryFormatter is removed in .NET 9. Migrate to System.Text.Json or a contract-based serialiser.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "enableViewStateMac\s*=\s*""false""") Or Regex.IsMatch(CodeLine, "EnableViewStateMac\s*=\s*False") Then
+            frmMain.ListCodeIssue("ViewState MAC Validation Disabled", "Without MAC validation the ViewState blob can be replaced by the client. As ViewState is deserialised with ObjectStateFormatter this yields remote code execution on the web server.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "(validationKey|decryptionKey)\s*=\s*""[0-9A-Fa-f]{16,}""") Then
+            frmMain.ListCodeIssue("Hard-Coded Machine Key", "A static machineKey in configuration allows anyone holding it to forge ViewState, forms authentication tickets and anti-forgery tokens.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckVBCookieAndSession(CodeLine As String, FileName As String)
+        ' Identify insecure cookie and session configuration
+        '===================================================
+
+        If Regex.IsMatch(CodeLine, "\b(HttpOnly|IsHttpOnly)\s*=\s*False") Or Regex.IsMatch(CodeLine, "httpOnlyCookies\s*=\s*""false""") Then
+            frmMain.ListCodeIssue("Cookie Accessible To Client-Side Script", "HttpOnly is disabled, so the cookie is readable by JavaScript and any cross-site scripting flaw becomes session hijacking.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\.\s*Secure\s*=\s*False") Or Regex.IsMatch(CodeLine, "requireSSL\s*=\s*""false""") Then
+            frmMain.ListCodeIssue("Cookie Transmitted Over Cleartext", "The Secure attribute is disabled, so the cookie is transmitted over plain HTTP where it can be captured by a network attacker.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "SameSite(Mode)?\s*(=|\.)\s*None") Then
+            frmMain.ListCodeIssue("Cookie SameSite Attribute Set To None", "SameSite=None re-enables cross-site transmission of the cookie and therefore classic cross-site request forgery. Use Lax or Strict unless a genuine cross-site flow requires otherwise.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "cookieless\s*=\s*""(UseUri|AutoDetect|true)""") Then
+            frmMain.ListCodeIssue("Cookieless Sessions Enabled", "The session identifier is carried in the URL, where it leaks through Referer headers, proxy logs, browser history and shared links.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bIgnoreAntiforgeryToken\b") Or Regex.IsMatch(CodeLine, "ValidateAntiForgeryToken\s*=\s*False") Then
+            frmMain.ListCodeIssue("Anti-CSRF Token Validation Disabled", "Anti-forgery validation is suppressed for this endpoint, allowing state-changing requests to be triggered from any origin using the victim's ambient credentials.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckVBCorsPolicy(CodeLine As String, FileName As String)
+        ' Identify permissive cross-origin resource sharing configuration
+        '================================================================
+
+        If Regex.IsMatch(CodeLine, "\bAllowAnyOrigin\s*\(\s*\)") Or Regex.IsMatch(CodeLine, "WithOrigins\s*\(\s*""\s*\*\s*""") Or Regex.IsMatch(CodeLine, "Access-Control-Allow-Origin""\s*,\s*""\s*\*") Then
+            frmMain.ListCodeIssue("Overly Permissive CORS Policy", "Any origin may read responses from this endpoint. Where the response contains user-specific data this exposes it to every site the victim visits.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bAllowCredentials\s*\(\s*\)") And Regex.IsMatch(CodeLine, "\b(AllowAnyOrigin|SetIsOriginAllowed)\b") Then
+            frmMain.ListCodeIssue("CORS Wildcard Origin Combined With Credentials", "Reflecting arbitrary origins while allowing credentials permits any website to issue authenticated cross-origin requests with the victim's cookies and to read the responses.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckVBHardcodedSecrets(CodeLine As String, FileName As String)
+        ' Identify credentials and API keys embedded in source
+        '=====================================================
+
+        If Regex.IsMatch(CodeLine, "AKIA[0-9A-Z]{16}") Then
+            frmMain.ListCodeIssue("Hard-Coded AWS Access Key", "A string matching the AWS access key ID format is present in source. Revoke it and move to an instance role or secrets manager.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "(gh[pousr]_[A-Za-z0-9]{36}|xox[baprs]-[A-Za-z0-9\-]{10,}|sk_live_[0-9a-zA-Z]{24,}|AIza[0-9A-Za-z\-_]{35})") Then
+            frmMain.ListCodeIssue("Hard-Coded Third-Party API Token", "A GitHub, Slack, Stripe or Google API token appears to be embedded in source.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "-----BEGIN\s+(RSA|EC|DSA|OPENSSH|PGP)?\s*PRIVATE KEY") Then
+            frmMain.ListCodeIssue("Private Key Embedded In Source", "A PEM-encoded private key is stored in the repository and must be treated as compromised.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "(?i)\b(Dim|Const|Private|Public|Friend|ReadOnly)\b[^=]*\b\w*(password|passwd|pwd|secret|apikey|api_key|token|privatekey|clientsecret)\w*\b[^=]*=\s*""[^""]{4,}""") Then
+            frmMain.ListCodeIssue("Hard-Coded Secret Assigned To Variable", "A variable whose name indicates a credential is initialised with a literal. The value is recoverable from the compiled assembly and persists in version control history.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "(?i)(password|pwd)\s*=\s*[^""'&;\s\)]{4,}\s*;") And Regex.IsMatch(CodeLine, "(?i)(data\s+source|server|initial\s+catalog|uid|user\s+id)") Then
+            frmMain.ListCodeIssue("Hard-Coded Database Credentials In Connection String", "A connection string with an inline password is present in source. Use integrated authentication, a managed identity, or a protected configuration section.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckVBDynamicCodeExecution(CodeLine As String, FileName As String)
+        ' Identify runtime code loading, late binding and reflection driven by input
+        '==========================================================================
+
+        If Regex.IsMatch(CodeLine, "\bAssembly\s*\.\s*(Load|LoadFrom|LoadFile|LoadWithPartialName|UnsafeLoadFrom)\s*\(") Then
+            frmMain.ListCodeIssue("Dynamic Assembly Loading", "An assembly is loaded at runtime. Where the path or byte array is influenced by user input, or the load path is writable by a lower-privileged user, this results in arbitrary code execution in the process. Load only from trusted, non-writable locations and verify the signature.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(VBCodeProvider|CSharpCodeProvider|CompileAssemblyFromSource|CompileAssemblyFromFile)\b") Then
+            frmMain.ListCodeIssue("Runtime Code Compilation", "The application compiles source at runtime. If any part of the compiled text derives from user input this is a direct remote code execution primitive.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(CallByName|Activator\s*\.\s*CreateInstance|Type\s*\.\s*GetType|InvokeMember)\s*\(") And IsUserInputVB(CodeLine) Then
+            frmMain.ListCodeIssue("Late Binding Driven By User Input", "CallByName and reflection resolve a member name at runtime. Where the name derives from user input an attacker can invoke arbitrary methods or properties on the target object.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(Shell|Process\s*\.\s*Start|ProcessStartInfo)\b") And IsUserInputVB(CodeLine) Then
+            frmMain.ListCodeIssue("Process Execution With User-Controlled Data", "A process is launched with arguments derived from user input. Where UseShellExecute is true, or the arguments are concatenated into a single string, shell metacharacters permit command injection. Pass arguments as a separate collection and validate them against an allow-list.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckVBInformationLeakage(CodeLine As String, FileName As String)
+        ' Identify exception detail returned to the client and suppressed errors
+        '======================================================================
+
+        If Regex.IsMatch(CodeLine, "\b(ex|e|exc|exception|err)\s*\.\s*(ToString\s*\(|StackTrace|InnerException|Message)\b") And _
+           Regex.IsMatch(CodeLine, "\b(Response\s*\.\s*Write|Content\s*\(|Json\s*\(|ViewBag|ViewData|innerHTML|\.Text\s*=)") Then
+            frmMain.ListCodeIssue("Exception Detail Returned To Client", "Exception text or a stack trace is written into the response, disclosing framework versions, file paths, SQL fragments and internal class names. Log the detail server-side and return only a correlation identifier.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bOn\s+Error\s+Resume\s+Next\b") Then
+            frmMain.ListCodeIssue("Unstructured Error Handling Suppresses All Failures", "On Error Resume Next causes execution to continue past every runtime error. Failed authorisation checks, failed cryptographic operations and failed writes all proceed silently, leaving the application in a state the developer believed impossible. Use structured Try/Catch.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bUseDeveloperExceptionPage\s*\(") And Not Regex.IsMatch(CodeLine, "(IsDevelopment|IsEnvironment)") Then
+            frmMain.ListCodeIssue("Developer Exception Page Enabled Unconditionally", "The developer exception page is registered without an environment guard, exposing full stack traces, source snippets, headers and cookies in production.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckVBHeaderInjection(CodeLine As String, FileName As String)
+        ' Identify response splitting and host header trust issues
+        '=========================================================
+
+        If Regex.IsMatch(CodeLine, "Response\s*\.\s*(AddHeader|AppendHeader|Headers\s*\.\s*(Add|Append)|Cookies\s*\.\s*Add)") And IsUserInputVB(CodeLine) Then
+            frmMain.ListCodeIssue("Potential HTTP Response Header Injection", "A response header value is built from user input. Where carriage return and line feed are not stripped an attacker can inject additional headers or a second response body, enabling cache poisoning and reflected cross-site scripting.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "Request\s*\.\s*(Headers\s*\(\s*""Host""|Url\s*\.\s*Host|ServerVariables\s*\(\s*""HTTP_HOST"")") Then
+            frmMain.ListCodeIssue("Reliance On The Host Header", "The Host header is attacker-controlled unless the web server enforces a host allow-list. Building absolute URLs from it leads to password-reset poisoning and web cache poisoning. Use a configured canonical hostname.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckVBAuthorisationWeakness(CodeLine As String, FileName As String)
+        ' Identify weakened authentication and authorisation configuration
+        '=================================================================
+
+        If Regex.IsMatch(CodeLine, "<\s*AllowAnonymous\s*>") Then
+            frmMain.ListCodeIssue("Endpoint Explicitly Marked AllowAnonymous", "Authorisation is bypassed for this action. Confirm that it serves only public data and does not accept identifiers permitting access to another user's records.", FileName, CodeIssue.LOW, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "Password\s*\.\s*Require(Digit|LowerCase|UpperCase|NonAlphanumeric)\s*=\s*False") Then
+            frmMain.ListCodeIssue("Relaxed Password Complexity Requirement", "A password complexity rule has been disabled. Where this is not compensated by a longer minimum length and a breached-password check the resulting policy is inadequate.", FileName, CodeIssue.LOW, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "Password\s*\.\s*RequiredLength\s*=\s*([0-9]|1[01])\b") Then
+            frmMain.ListCodeIssue("Insufficient Minimum Password Length", "The minimum password length is set below 12 characters, which is inadequate in the absence of a breached-password check.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "Lockout\s*\.\s*AllowedForNewUsers\s*=\s*False") Then
+            frmMain.ListCodeIssue("Account Lockout Disabled", "Lockout is disabled, permitting sustained online password guessing against the authentication endpoint.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(WindowsIdentity\s*\.\s*Impersonate|LogonUser|ImpersonateLoggedOnUser)\b") Then
+            frmMain.ListCodeIssue("Thread Impersonation In Use", "Confirm that the impersonation context is always reverted in a Finally block; otherwise subsequent work on the pooled thread runs with the elevated identity.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+    End Sub
 End Module

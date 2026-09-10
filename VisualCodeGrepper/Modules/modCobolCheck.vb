@@ -41,6 +41,15 @@ Module modCobolCheck
         CheckUnsafeTempFiles(CodeLine, FileName)        ' Check for static/obvious filenames for temp files
         CheckDynamicCall(CodeLine, FileName)            ' Identify any user controlled variables used for dynamic function calls
 
+        '== Extended ruleset ==
+        CheckCobolHardcodedCredentials(CodeLine, FileName)  ' Credentials in WORKING-STORAGE, MOVE and SQL CONNECT
+        CheckCobolDynamicSql(CodeLine, FileName)           ' PREPARE/EXECUTE IMMEDIATE and STRING-built statements
+        CheckCobolCicsSecurity(CodeLine, FileName)         ' Dynamic LINK/XCTL/START, spool interface, storage and RESP
+        CheckCobolDataHandling(CodeLine, FileName)         ' REDEFINES, SIZE ERROR, reference modification, OCCURS DEPENDING
+        CheckCobolFileStatus(CodeLine, FileName)           ' File operations without inline status checking
+        CheckCobolSensitiveDisplay(CodeLine, FileName)     ' Sensitive fields written to logs, terminals and reports
+        CheckCobolSystemInterface(CodeLine, FileName)      ' System service calls, dynamic CALL and ACCEPT sources
+
         If Regex.IsMatch(CodeLine, "(LOWER|UPPER)\-CASE\s*\(\S*(Password|password|PASSWORD|pwd|PWD|passwd|PASSWD)") Then
             frmMain.ListCodeIssue("Unsafe Password Management", "The application appears to handle passwords in a case-insensitive manner. This can greatly increase the likelihood of successful brute-force and/or dictionary attacks.", FileName, CodeIssue.MEDIUM, CodeLine)
         End If
@@ -449,4 +458,149 @@ Module modCobolCheck
         End If
     End Sub
 
+
+    '======================================================================================
+    '== EXTENDED RULESET                                                                 ==
+    '== Additional checks appended without altering any pre-existing logic.              ==
+    '======================================================================================
+
+    Private Sub CheckCobolHardcodedCredentials(CodeLine As String, FileName As String)
+        ' Identify credentials embedded in WORKING-STORAGE or MOVE statements
+        '====================================================================
+
+        If Regex.IsMatch(CodeLine, "(?i)\b(MOVE|VALUE)\b[^\.]*['""][^'""]{3,}['""][^\.]*\bTO\b[^\.]*\b\w*(PASSWORD|PASSWD|PWD|USERID|USER-ID|SECRET|KEY|TOKEN|CREDENTIAL)\w*\b") Or _
+           Regex.IsMatch(CodeLine, "(?i)\b\w*(PASSWORD|PASSWD|PWD|SECRET|APIKEY|TOKEN)\w*\b[^\.]*\bVALUE\b\s*['""][^'""]{3,}['""]") Then
+            frmMain.ListCodeIssue("Hard-Coded Credential In Source", "A credential appears as a literal in WORKING-STORAGE or in a MOVE statement. Literals are retained in the compiled load module and are recoverable with a straightforward dump or browse of the module, so anyone with read access to the load library obtains the credential. Source credentials from a security product such as RACF, ACF2 or Top Secret, or from an external key store.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bEXEC\s+SQL\b[^\.]*\bCONNECT\b[^\.]*\bUSING\b") Then
+            frmMain.ListCodeIssue("Database Connection Credentials In Source", "An EXEC SQL CONNECT ... USING statement supplies a password. Where the password is a literal or a WORKING-STORAGE item initialised with VALUE it is embedded in the load module; where it is passed in, confirm the source is a protected store and that the field is cleared after use.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckCobolDynamicSql(CodeLine As String, FileName As String)
+        ' Identify dynamic SQL construction in embedded DB2
+        '==================================================
+
+        If Regex.IsMatch(CodeLine, "(?i)\bEXEC\s+SQL\b[^\.]*\b(PREPARE|EXECUTE\s+IMMEDIATE)\b") Then
+            frmMain.ListCodeIssue("Dynamic SQL In Embedded DB2", "PREPARE and EXECUTE IMMEDIATE build the statement text at runtime. Where that text is assembled with STRING from input fields rather than parameterised with host variables and placeholders, the input is interpreted as SQL. Use static SQL where the statement shape is fixed, and parameter markers with a bound SQLDA where it is not.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bSTRING\b[^\.]*\bDELIMITED\b") And Regex.IsMatch(CodeLine, "(?i)\b\w*(SQL|STMT|STATEMENT|QUERY|WHERE|SELECT)\w*\b") Then
+            frmMain.ListCodeIssue("SQL Statement Assembled With STRING", "A statement buffer is built by concatenation. Any input field placed into the buffer without validation alters the statement structure. The absence of quoting helpers in COBOL makes this particularly error-prone; prefer static SQL with host variables.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bEXEC\s+SQL\b[^\.]*\bWITH\s+UR\b") Then
+            frmMain.ListCodeIssue("Uncommitted Read Isolation Level", "WITH UR reads rows that other units of work have modified but not committed. Where the value read is used for an authorisation or balance decision the decision may be based on data that is subsequently rolled back.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckCobolCicsSecurity(CodeLine As String, FileName As String)
+        ' Identify CICS commands with security implications beyond the existing checks
+        '============================================================================
+
+        If Regex.IsMatch(CodeLine, "(?i)\bEXEC\s+CICS\b[^\.]*\b(LINK|XCTL|START)\b") And Regex.IsMatch(CodeLine, "(?i)\bPROGRAM\s*\(\s*[A-Z0-9\-]+\s*\)") And Not Regex.IsMatch(CodeLine, "(?i)PROGRAM\s*\(\s*['""]") Then
+            frmMain.ListCodeIssue("Dynamic Program Invocation In CICS", "The program name passed to LINK, XCTL or START is held in a variable. Where that variable can be influenced by terminal input or by a communication area supplied by another transaction, an attacker selects which program executes - within the same task and therefore with the same authority. Validate the name against a fixed table of permitted programs.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bEXEC\s+CICS\b[^\.]*\b(SPOOLOPEN|SPOOLWRITE|SPOOLCLOSE)\b") Then
+            frmMain.ListCodeIssue("CICS Spool Interface In Use", "The spool interface can submit JCL to the internal reader. A transaction that writes attacker-influenced data to the spool may therefore submit arbitrary batch work, executing under the CICS region's authority rather than the end user's. Restrict the transaction and validate every field written.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bEXEC\s+CICS\b[^\.]*\b(ADDRESS|GETMAIN|FREEMAIN)\b") Then
+            frmMain.ListCodeIssue("Direct Storage Manipulation In CICS", "ADDRESS and GETMAIN expose raw storage addresses. Combined with an unchecked length or an index derived from input this permits reads and writes outside the intended area, which in a shared region can corrupt or disclose another transaction's data.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bEXEC\s+CICS\b[^\.]*\b(READ|WRITE|REWRITE|DELETE|STARTBR)\b") And Not Regex.IsMatch(CodeLine, "(?i)\bRESP\s*\(|\bNOHANDLE\b") Then
+            frmMain.ListCodeIssue("CICS File Operation Without Response Checking", "No RESP option is present, so the outcome of the file operation is not examined on this line. Where the operation fails - because of a security violation, a missing record or a locked file - processing continues on stale or uninitialised data.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bEXEC\s+CICS\b[^\.]*\bSYNCPOINT\s+ROLLBACK\b") Then
+            frmMain.ListCodeIssue("Explicit Rollback Issued", "Confirm that the rollback covers every resource updated in the unit of work. A partial rollback leaves related files inconsistent, which in a financial context is exploitable as well as incorrect.", FileName, CodeIssue.LOW, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckCobolDataHandling(CodeLine As String, FileName As String)
+        ' Identify truncation, redefinition and arithmetic issues
+        '========================================================
+
+        If Regex.IsMatch(CodeLine, "(?i)\bREDEFINES\b") Then
+            frmMain.ListCodeIssue("REDEFINES Clause In Use", "REDEFINES reinterprets the same storage under a different picture. Where the two definitions have incompatible types - alphanumeric over packed decimal, for example - reading through the wrong definition produces values that never underwent validation and may cause an S0C7 abend or silently corrupt a numeric field. Confirm that the active interpretation is always determined by a validated discriminator field.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\b(COMPUTE|ADD|SUBTRACT|MULTIPLY|DIVIDE)\b") And Not Regex.IsMatch(CodeLine, "(?i)\b(ON\s+SIZE\s+ERROR|NOT\s+ON\s+SIZE\s+ERROR)\b") Then
+            frmMain.ListCodeIssue("Arithmetic Without ON SIZE ERROR", "No size-error clause is present. When a result exceeds the receiving field's picture the high-order digits are discarded silently, so a large amount becomes a small one with no diagnostic. In financial processing this is both a correctness defect and an abuse vector where the input value is externally supplied.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bDIVIDE\b") And Not Regex.IsMatch(CodeLine, "(?i)\bON\s+SIZE\s+ERROR\b") Then
+            frmMain.ListCodeIssue("Division Without Divide-By-Zero Protection", "A DIVIDE without ON SIZE ERROR abends with S0CB when the divisor is zero. Where the divisor derives from input this is a denial-of-service condition reachable by any user of the transaction.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bEVALUATE\b") And Not Regex.IsMatch(CodeLine, "(?i)\bWHEN\s+OTHER\b") Then
+            frmMain.ListCodeIssue("EVALUATE Without A WHEN OTHER Branch", "Confirm that a WHEN OTHER branch exists for this EVALUATE. Without one, an unexpected value - including one supplied by a user or received from an upstream system - falls through with no action taken, leaving the program in an undefined state while appearing to succeed.", FileName, CodeIssue.LOW, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bMOVE\b[^\.]*\bREFERENCE\s+MODIFICATION\b") Or Regex.IsMatch(CodeLine, "\w+\s*\(\s*\w+\s*:\s*\w+\s*\)") Then
+            frmMain.ListCodeIssue("Reference Modification With Variable Offset Or Length", "Reference modification of the form FIELD(OFFSET:LENGTH) is not bounds-checked by default. A variable offset or length derived from input reads or writes outside the field, which is the closest COBOL equivalent of a buffer overflow. Compile with SSRANGE for testing and validate the subscripts explicitly.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bOCCURS\b[^\.]*\bDEPENDING\s+ON\b") Then
+            frmMain.ListCodeIssue("Variable-Length Table (OCCURS DEPENDING ON)", "The table length is controlled by another field. Where that field is populated from an input record without range validation the program addresses storage beyond the table, producing corruption or an abend. Validate the controlling field against the declared minimum and maximum before use.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckCobolFileStatus(CodeLine As String, FileName As String)
+        ' Identify unchecked file operations
+        '===================================
+
+        If Regex.IsMatch(CodeLine, "(?i)^\s*(\d+\s+)?\b(OPEN|CLOSE|READ|WRITE|REWRITE|DELETE|START)\b") And Not Regex.IsMatch(CodeLine, "(?i)\b(EXEC\s+CICS|INVALID\s+KEY|AT\s+END|NOT\s+AT\s+END)\b") Then
+            frmMain.ListCodeIssue("File Operation Without An Inline Status Check", "No INVALID KEY or AT END phrase is present on this statement. Unless the FILE STATUS field is examined immediately afterwards, a failed open or read leaves the record area holding the previous record - or uninitialised storage - and processing continues on data that was never read. Declare FILE STATUS on the FD and test it after every operation.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bOPEN\s+(I-O|EXTEND|OUTPUT)\b") Then
+            frmMain.ListCodeIssue("File Opened For Update", "The file is opened for write access. Confirm that the dataset is protected by an appropriate RACF profile, that the program genuinely requires update access, and that concurrent access is controlled - COBOL does not serialise access for you.", FileName, CodeIssue.LOW, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckCobolSensitiveDisplay(CodeLine As String, FileName As String)
+        ' Identify sensitive data written to logs, terminals or reports
+        '==============================================================
+
+        If Regex.IsMatch(CodeLine, "(?i)\b(DISPLAY|EXEC\s+CICS\s+SEND|WRITE)\b") And _
+           Regex.IsMatch(CodeLine, "(?i)\b\w*(PASSWORD|PASSWD|PWD|SECRET|TOKEN|PIN|CVV|CARD-NO|CARDNO|ACCT-NO|SSN|NATIONAL-ID)\w*\b") Then
+            frmMain.ListCodeIssue("Sensitive Field Written To Output", "A field whose name indicates sensitive content is written to the terminal, the job log or a report. Job logs are retained on spool, are frequently readable by operations staff and are archived to tape, so the exposure extends far beyond the original transaction. Mask the value or omit it.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bDISPLAY\b") And Regex.IsMatch(CodeLine, "(?i)\bUPON\s+(CONSOLE|SYSOUT)\b") Then
+            frmMain.ListCodeIssue("Output Written To The System Console", "Console messages are visible to all operations staff and are captured in SYSLOG. Confirm that no business data is written to the console.", FileName, CodeIssue.LOW, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckCobolSystemInterface(CodeLine As String, FileName As String)
+        ' Identify calls into system services and other programs
+        '=======================================================
+
+        If Regex.IsMatch(CodeLine, "(?i)\bCALL\b\s+['""](SYSTEM|BPXWDYN|IEFBR14|IKJEFT01|SYSTEMFUNC|SH)['""]") Then
+            frmMain.ListCodeIssue("Call To A System Service", "The program invokes a system service capable of allocating datasets, issuing TSO commands or running a shell. Where any parameter is derived from input this permits arbitrary dataset access or command execution under the job's authority. Validate every parameter against a fixed allow-list.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bCALL\b\s+\w+\s*(USING|$)") And Not Regex.IsMatch(CodeLine, "(?i)\bCALL\b\s*['""]") Then
+            frmMain.ListCodeIssue("Dynamic CALL With A Variable Program Name", "The called program is named by a variable, so the target is resolved at runtime from the load library concatenation. An attacker who can influence the variable, or who can place a module earlier in the concatenation, controls which code executes. Validate the name against a fixed table and confirm the load libraries are RACF-protected against update.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bCALL\b[^\.]*\b(RACROUTE|IRRSEQ00|IRRSDL00)\b") Then
+            frmMain.ListCodeIssue("Direct Security Product Interface", "The program calls the security manager interface directly. Confirm that the return and reason codes are examined for every call - a common defect is to treat any non-abend return as success, which grants access when the check has in fact failed.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        If Regex.IsMatch(CodeLine, "(?i)\bACCEPT\b[^\.]*\bFROM\b") Then
+            frmMain.ListCodeIssue("Data Accepted From An External Source", "ACCEPT reads from the console, SYSIN or an environment variable. The value is unvalidated and untyped at this point; confirm it is range-checked and class-tested (NUMERIC/ALPHABETIC) before it is used in arithmetic, as a subscript or in a file operation.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+    End Sub
 End Module

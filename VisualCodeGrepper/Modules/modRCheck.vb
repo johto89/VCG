@@ -44,6 +44,15 @@ Module modRCheck
         CheckRandomisation(CodeLine, FileName)          ' Locate any use of randomisation functions that are not cryptographically secure
         CheckUnsafeTempFiles(CodeLine, FileName)        ' Check for static/obvious filenames for temp files
 
+        '== Extended ruleset ==
+        CheckRCodeInjection(CodeLine, FileName)         ' eval(parse()), do.call, remote source() and dynamic symbols
+        CheckRPackageIntegrity(CodeLine, FileName)      ' Unpinned installs, cleartext repositories, disabled TLS
+        CheckRSqlInjection(CodeLine, FileName)          ' Queries built with paste/sprintf/glue and inline credentials
+        CheckRShinySecurity(CodeLine, FileName)         ' Shiny XSS, exposed binds, Plumber endpoints and uploads
+        CheckRDeserialization(CodeLine, FileName)       ' readRDS/load code execution, including from remote sources
+        CheckRHardcodedSecrets(CodeLine, FileName)      ' API keys and credentials embedded in analysis scripts
+        CheckRReproducibility(CodeLine, FileName)       ' Seeded/non-cryptographic randomness and suppressed diagnostics
+
     End Sub
 
     Private Sub TrackRegistryUse(ByVal CodeLine As String, ByVal FileName As String)
@@ -466,4 +475,142 @@ Module modRCheck
 
     End Sub
 
+
+    '======================================================================================
+    '== EXTENDED RULESET                                                                 ==
+    '== Additional checks appended without altering any pre-existing logic.              ==
+    '======================================================================================
+
+    Private Sub CheckRCodeInjection(ByVal CodeLine As String, ByVal FileName As String)
+        ' Identify dynamic evaluation of R expressions
+        '=============================================
+
+        If Regex.IsMatch(CodeLine, "\beval\s*\(\s*parse\s*\(") Or Regex.IsMatch(CodeLine, "\bparse\s*\(\s*text\s*=") Then
+            frmMain.ListCodeIssue("Dynamic Evaluation of R Code", "eval(parse(text=...)) compiles and executes a string as R code. R has no sandbox, so any injected fragment can call system(), read the filesystem or open network connections with the privileges of the R process. Where the string incorporates data from a file, a database, a web request or a Shiny input this is a remote code execution primitive. Replace with explicit indexing, match.arg or switch.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(evalq|eval\.parent|local\s*\(|do\.call\s*\()") Then
+            frmMain.ListCodeIssue("Indirect Function Invocation", "do.call and the eval family resolve the function to be called at runtime. Where the function name derives from external data an attacker can invoke any function in the search path, including system and unlink. Map the input to a fixed list of permitted functions.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bsource\s*\(\s*(url\s*\(|['""]https?://)") Then
+            frmMain.ListCodeIssue("Remote Script Sourced Over The Network", "source() fetches and immediately executes a remote script. Without TLS verification and an integrity check the executed code is whatever the network path or the host chooses to return, which has been the vector for several package-ecosystem compromises. Vendor the script locally and verify its hash.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(assign|get|mget|getFunction|match\.fun)\s*\(") Then
+            frmMain.ListCodeIssue("Dynamic Symbol Resolution", "assign() and get() resolve variable or function names at runtime. Where the name is externally supplied an attacker can overwrite objects in the global environment - including function definitions that are subsequently called - or read objects they should not reach.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckRPackageIntegrity(ByVal CodeLine As String, ByVal FileName As String)
+        ' Identify unsafe package installation and dependency sourcing
+        '=============================================================
+
+        If Regex.IsMatch(CodeLine, "\b(install_github|install_gitlab|install_bitbucket|install_url|install_git)\s*\(") Then
+            frmMain.ListCodeIssue("Package Installed Directly From A Source Repository", "Installing from a repository branch pulls whatever code is at the tip at install time, with no review, no signature and no reproducibility. A compromise of the upstream account, or a force-push, silently changes what is executed. Pin to a commit hash at minimum, and prefer a curated internal mirror.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "install\.packages\s*\(") And Regex.IsMatch(CodeLine, "repos\s*=\s*['""]http://") Then
+            frmMain.ListCodeIssue("Packages Installed Over Cleartext HTTP", "The repository is contacted over plain HTTP, so a network attacker can substitute a modified package. R package installation executes arbitrary code from the package's configure and install scripts, making this a direct code execution vector.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bdownload\.file\s*\(") And Regex.IsMatch(CodeLine, "['""]http://") Then
+            frmMain.ListCodeIssue("File Downloaded Over Cleartext HTTP", "Content fetched over HTTP can be modified in transit. Where the downloaded file is subsequently sourced, loaded or executed this yields code execution. Use HTTPS and verify a published checksum.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "(ssl_verifypeer|ssl_verifyhost)\s*=\s*(FALSE|0)") Or Regex.IsMatch(CodeLine, "config\s*\(\s*ssl_verifypeer\s*=\s*(FALSE|0)") Then
+            frmMain.ListCodeIssue("TLS Verification Disabled", "Certificate verification has been switched off for HTTP requests, so any certificate is accepted and the connection offers no protection against active interception.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckRSqlInjection(ByVal CodeLine As String, ByVal FileName As String)
+        ' Identify database queries assembled by string construction
+        '===========================================================
+
+        If Regex.IsMatch(CodeLine, "\b(dbGetQuery|dbSendQuery|dbExecute|dbSendStatement|sqlQuery|dbWriteTable)\s*\(") Then
+            If Regex.IsMatch(CodeLine, "\b(paste0?|sprintf|glue|str_c|format)\s*\(") Then
+                frmMain.ListCodeIssue("SQL Statement Built By String Construction", "The query is assembled with paste, sprintf or glue rather than parameterised. Any value originating from a file, an argument or a web input is interpreted as SQL. Use dbBind with placeholders, or DBI::sqlInterpolate, which quotes values correctly for the target backend.", FileName, CodeIssue.HIGH, CodeLine)
+            End If
+        End If
+        If Regex.IsMatch(CodeLine, "\bdbConnect\s*\(") And Regex.IsMatch(CodeLine, "(?i)(password|pwd)\s*=\s*['""][^'""]+['""]") Then
+            frmMain.ListCodeIssue("Hard-Coded Database Password", "A database password appears as a literal in the connection call. Scripts are routinely committed to version control and shared between analysts. Use an environment variable, the keyring package, or an ODBC DSN holding the credential outside the script.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckRShinySecurity(ByVal CodeLine As String, ByVal FileName As String)
+        ' Identify Shiny and Plumber application security issues
+        '=======================================================
+
+        '== Reflected input rendered as HTML ==
+        If Regex.IsMatch(CodeLine, "\b(HTML|htmlOutput|uiOutput|renderUI|renderText|includeHTML|tags\$script)\s*\(") And Regex.IsMatch(CodeLine, "\binput\$") Then
+            frmMain.ListCodeIssue("Potential Cross-Site Scripting In A Shiny Application", "A reactive input value is rendered as raw HTML. HTML() explicitly marks the string as safe and suppresses escaping, so any markup or script tag supplied by the user executes in the browser of every user who views it. Use textOutput, which escapes, or sanitise the value before wrapping it in HTML().", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        '== Application bound to all interfaces ==
+        If Regex.IsMatch(CodeLine, "host\s*=\s*['""]0\.0\.0\.0['""]") Then
+            frmMain.ListCodeIssue("Application Bound To All Network Interfaces", "The application listens on every interface. Shiny and Plumber have no built-in authentication, so unless a reverse proxy enforces access control the application - and any file or database access it performs - is exposed to the whole network.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+
+        '== Plumber endpoints ==
+        If Regex.IsMatch(CodeLine, "#\*\s*@(get|post|put|delete|use)\b") Then
+            frmMain.ListCodeIssue("Plumber API Endpoint Defined", "Plumber applies no authentication or authorisation by default and does not rate-limit. Confirm that a filter enforces authentication, that parameters are validated and coerced to the expected type, and that error output does not return R error messages containing file paths to the caller.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "#\*\s*@serializer\s+(html|htmlwidget|unboxedJSON)\b") Then
+            frmMain.ListCodeIssue("Plumber HTML Serializer In Use", "Returning HTML from an API endpoint reintroduces cross-site scripting risk where any part of the response derives from request parameters.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+        '== File upload handling ==
+        If Regex.IsMatch(CodeLine, "\b(fileInput|input\$\w*file\w*\$datapath)\b") Then
+            frmMain.ListCodeIssue("File Upload Accepted", "Confirm that the uploaded file's declared name is never used to build a destination path, that the size is bounded, and that the content is not passed to readRDS, load or source - all of which execute code contained in the file.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckRDeserialization(ByVal CodeLine As String, ByVal FileName As String)
+        ' Identify object loading paths that execute code
+        '================================================
+
+        If Regex.IsMatch(CodeLine, "\b(readRDS|load|unserialize|dget|loadNamespace)\s*\(") Then
+            frmMain.ListCodeIssue("Object Deserialization From A File Or Connection", "R serialisation preserves promises, environments and reference objects. Loading an untrusted .RData or .rds file therefore executes code at load time - the file need only be opened, not used. Never load serialised objects received from outside the trust boundary; exchange data as CSV, Parquet or JSON instead.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(load|readRDS)\s*\(\s*(url\s*\(|['""]https?://)") Then
+            frmMain.ListCodeIssue("Serialised Object Loaded Over The Network", "The object is fetched from a remote location and deserialised, combining an untrusted source with a deserialisation sink that executes code. This is a direct remote code execution path.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckRHardcodedSecrets(ByVal CodeLine As String, ByVal FileName As String)
+        ' Identify credentials and API keys embedded in scripts
+        '======================================================
+
+        If Regex.IsMatch(CodeLine, "AKIA[0-9A-Z]{16}") Then
+            frmMain.ListCodeIssue("Hard-Coded AWS Access Key", "A string matching the AWS access key ID format is present in the script. Revoke the key and load credentials from the environment or an instance role.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "(gh[pousr]_[A-Za-z0-9]{36}|xox[baprs]-[A-Za-z0-9\-]{10,}|sk_live_[0-9a-zA-Z]{24,}|AIza[0-9A-Za-z\-_]{35})") Then
+            frmMain.ListCodeIssue("Hard-Coded Third-Party API Token", "A GitHub, Slack, Stripe or Google API token appears in the script. Analysis scripts are shared and committed frequently, so embedded tokens leak readily.", FileName, CodeIssue.CRITICAL, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "(?i)\b\w*(password|passwd|pwd|secret|apikey|api_key|token|auth)\w*\s*(<-|=)\s*['""][^'""]{4,}['""]") Then
+            frmMain.ListCodeIssue("Hard-Coded Secret Assigned To Variable", "A variable whose name indicates a credential is assigned a literal string. Use Sys.getenv(), the keyring package, or an .Renviron file that is excluded from version control.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\bSys\.setenv\s*\(") And Regex.IsMatch(CodeLine, "(?i)(key|token|password|secret)") Then
+            frmMain.ListCodeIssue("Secret Written Into The Process Environment", "Setting a credential with Sys.setenv places it in the script and therefore in version control. It also exposes the value to every child process and, on some platforms, to other users through the process listing.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+    End Sub
+
+    Private Sub CheckRReproducibility(ByVal CodeLine As String, ByVal FileName As String)
+        ' Identify randomness and environment handling that affect integrity of results
+        '==============================================================================
+
+        If Regex.IsMatch(CodeLine, "\bset\.seed\s*\(") And Regex.IsMatch(CodeLine, "(?i)\b\w*(password|token|key|salt|nonce|secret)\w*\b") Then
+            frmMain.ListCodeIssue("Seeded PRNG Used For A Security Value", "R's Mersenne Twister is not a cryptographic generator, and an explicit seed makes the entire output sequence reproducible. Anything used as a password, token, salt or key must come from a cryptographic source such as openssl::rand_bytes.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\b(sample|runif|rnorm)\s*\(") And Regex.IsMatch(CodeLine, "(?i)\b\w*(password|token|key|salt|nonce|otp|secret|id)\w*\b") Then
+            frmMain.ListCodeIssue("Non-Cryptographic Randomness Used For A Security Value", "sample(), runif() and rnorm() draw from a non-cryptographic generator whose internal state is recoverable from a modest number of outputs. Use openssl::rand_bytes or a comparable CSPRNG.", FileName, CodeIssue.HIGH, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\brm\s*\(\s*list\s*=\s*ls\s*\(") Then
+            frmMain.ListCodeIssue("Global Environment Cleared At Runtime", "Clearing the global environment from within a script destroys objects belonging to the caller and can mask errors by removing partially computed results. It also does not reset loaded packages or options, so it gives a false impression of a clean state.", FileName, CodeIssue.LOW, CodeLine)
+        End If
+        If Regex.IsMatch(CodeLine, "\boptions\s*\(\s*(warn\s*=\s*-1|error\s*=\s*NULL)") Then
+            frmMain.ListCodeIssue("Warnings Or Errors Suppressed Globally", "Suppressing warnings hides coercion failures, NA introduction and encoding problems that frequently indicate that the data being processed is not what the script assumes.", FileName, CodeIssue.MEDIUM, CodeLine)
+        End If
+
+    End Sub
 End Module
